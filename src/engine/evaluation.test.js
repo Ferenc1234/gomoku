@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { advantagePoints, rateMove, winProbability } from './evaluation.js'
+import { displayEnginePoints, enginePoints, formatEnginePoints, rateMove, rateOpening, winProbability } from './evaluation.js'
 
 test('converts scores to bounded win probabilities around 50 percent', () => {
   assert.equal(winProbability(0), 50)
@@ -8,9 +8,13 @@ test('converts scores to bounded win probabilities around 50 percent', () => {
   assert.ok(winProbability(-10000) > 0)
 })
 
-test('converts engine score to Gomoku advantage points', () => {
-  assert.equal(advantagePoints(100), 1)
-  assert.equal(advantagePoints(-250), -2.5)
+test('uses engine points with white-positive display orientation', () => {
+  assert.equal(enginePoints(100), 100)
+  assert.equal(displayEnginePoints(250), -250)
+  assert.equal(formatEnginePoints(250), '-250')
+  assert.equal(formatEnginePoints(-250), '250')
+  assert.equal(formatEnginePoints(-29998), 'M1')
+  assert.equal(formatEnginePoints(29996), '-M2')
 })
 
 test('rates points gained or lost from the mover perspective', () => {
@@ -19,17 +23,14 @@ test('rates points gained or lost from the mover perspective', () => {
     { score: 70, winPercent: 60 },
     { x: 1, y: 1, color: 'B' },
   )
-  assert.equal(blackLoss.pointsLost, 1.3)
-  assert.equal(blackLoss.pointsGained, 0)
-  assert.equal(blackLoss.pointAdvantage, 0.7)
+  assert.equal(blackLoss.pointAdvantage, -70)
 
   const whiteGain = rateMove(
     { score: 200, winPercent: 70 },
     { score: 70, winPercent: 60 },
     { x: 1, y: 1, color: 'W' },
   )
-  assert.equal(whiteGain.pointsGained, 1.3)
-  assert.equal(whiteGain.pointsLost, 0)
+  assert.equal(whiteGain.pointAdvantage, -70)
 })
 
 test('labels an exact-five terminal move as winning', () => {
@@ -39,7 +40,7 @@ test('labels an exact-five terminal move as winning', () => {
     { x: 4, y: 7, color: 'B' },
   )
   assert.equal(result.rating, 'winning')
-  assert.equal(result.pointsGained, 12)
+  assert.equal(result.pointAdvantage, -10000)
 })
 
 test('does not label an unrecommended move best when win chances are saturated', () => {
@@ -49,12 +50,13 @@ test('does not label an unrecommended move best when win chances are saturated',
     { x: 11, y: 11, color: 'W' },
   )
   assert.equal(rating.rating, 'blunder')
-  assert.equal(rating.pointsLost, 8)
+  assert.equal(rating.pointAdvantage, -1200)
 })
 
-test('caps forced-win scores at a readable Gomoku advantage', () => {
-  assert.equal(advantagePoints(30000), 12)
-  assert.equal(advantagePoints(-30000), -12)
+test('rates opening balance around zero engine points', () => {
+  assert.equal(rateOpening({ score: 40 }).rating, 'opening-balanced')
+  assert.equal(rateOpening({ score: -500 }).rating, 'opening-white')
+  assert.equal(rateOpening({ score: 500 }).rating, 'opening-black')
 })
 
 test('rates a strong move in the mover perspective', () => {

@@ -1,12 +1,18 @@
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { displayEnginePoints } from '../engine/evaluation.js'
+
+function formatGraphValue(value) {
+  return `${value > 0 ? '+' : ''}${Math.round(value).toLocaleString('cs-CZ')}`
+}
 
 function EvaluationGraph({ analyses, viewMode, currentMove }) {
   const visibleAnalyses = viewMode === 'full' ? analyses : analyses.slice(0, currentMove + 1)
-  const graphData = visibleAnalyses.map((analysis, index) => ({
+  const graphData = visibleAnalyses.filter((analysis) => Number.isFinite(analysis?.score)).map((analysis, index) => ({
     move: index,
-    whiteAdvantage: Number((50 - analysis.winPercent).toFixed(1)),
-    blackWinPercent: analysis.winPercent,
+    enginePoints: displayEnginePoints(analysis.score),
   }))
+  const currentMax = Math.max(...graphData.map(({ enginePoints }) => Math.abs(enginePoints)), 0)
+  const graphMax = currentMax === 0 ? 1 : currentMax
 
   return (
     <section className="panel graph-panel" aria-label="Graf hodnocení">
@@ -27,21 +33,21 @@ function EvaluationGraph({ analyses, viewMode, currentMove }) {
               </defs>
               <CartesianGrid vertical={false} stroke="#e5e7df" strokeDasharray="3 5" />
               <XAxis dataKey="move" tickLine={false} axisLine={false} tick={{ fill: '#7b8179', fontSize: 11 }} />
-              <YAxis domain={[-50, 50]} ticks={[-50, -25, 0, 25, 50]} tickFormatter={(value) => `${value > 0 ? '+' : ''}${value}%`} tickLine={false} axisLine={false} tick={{ fill: '#7b8179', fontSize: 11 }} />
+              <YAxis domain={[-graphMax, graphMax]} ticks={[-graphMax, 0, graphMax]} tickFormatter={formatGraphValue} tickLine={false} axisLine={false} tick={{ fill: '#7b8179', fontSize: 11 }} />
               <ReferenceLine y={0} stroke="#b9bdb4" strokeWidth={1.25} />
               <Tooltip
-                formatter={(_value, _name, item) => [`${item.payload.blackWinPercent}% pro černého`, 'Šance na výhru']}
+                formatter={(value) => [formatGraphValue(value), 'Eval hodnota']}
                 labelFormatter={(label) => label === 0 ? 'Výchozí pozice' : `Po tahu ${label}`}
                 contentStyle={{ border: '1px solid #e1e4da', borderRadius: 8, fontSize: 12 }}
               />
-              <Area type="monotone" dataKey="whiteAdvantage" stroke="#8cb52a" strokeWidth={2.5} fill="url(#advantageFill)" activeDot={{ r: 5, fill: '#8cb52a', stroke: '#fff', strokeWidth: 2 }} />
+              <Area type="monotone" dataKey="enginePoints" stroke="#8cb52a" strokeWidth={2.5} fill="url(#advantageFill)" activeDot={{ r: 5, fill: '#8cb52a', stroke: '#fff', strokeWidth: 2 }} />
             </AreaChart>
           </ResponsiveContainer>
         ) : (
           <div className="graph-empty">Zatím není k dispozici dost tahů pro graf.</div>
         )}
       </div>
-      <div className="graph-caption"><span>Výhoda bílého ↑</span><span>Výhoda černého ↓</span></div>
+      <div className="graph-caption"><span>+ bílý</span><span>- černý</span></div>
     </section>
   )
 }

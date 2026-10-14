@@ -42,11 +42,22 @@ export function winProbability(score, scale = 0.01) {
   return Math.max(1e-9, Math.min(100 - 1e-9, probability))
 }
 
-export function advantagePoints(score) {
-  const value = Number(score || 0)
-  if (value >= 6000) return 12
-  if (value <= -6000) return -12
-  return Number((value / 100).toFixed(2))
+export function enginePoints(score) {
+  return Math.round(Number(score || 0))
+}
+
+export function displayEnginePoints(score) {
+  return -enginePoints(score)
+}
+
+export function formatEnginePoints(score, alreadyDisplayed = false) {
+  const value = alreadyDisplayed ? enginePoints(score) : displayEnginePoints(score)
+  const absolute = Math.abs(value)
+  if (absolute >= 29500) {
+    const movesToMate = Math.max(1, Math.ceil((30000 - absolute) / 2))
+    return `${value < 0 ? '-' : ''}M${movesToMate}`
+  }
+  return String(value)
 }
 
 function isWinningMove(board, x, y, color) {
@@ -140,11 +151,11 @@ export function rateMove(before, after, move) {
   const afterChance = move.color === 'B' ? after.winPercent : 100 - after.winPercent
   const drop = Math.max(0, beforeChance - afterChance)
   const isBestMove = before.pv?.[0]?.x === move.x && before.pv?.[0]?.y === move.y
-  const beforeAdvantage = advantagePoints(before.score)
-  const afterAdvantage = advantagePoints(after.score)
-  const beforeMoverAdvantage = move.color === 'B' ? beforeAdvantage : -beforeAdvantage
-  const afterMoverAdvantage = move.color === 'B' ? afterAdvantage : -afterAdvantage
-  const pointLoss = Math.max(0, beforeMoverAdvantage - afterMoverAdvantage)
+  const beforeAdvantage = displayEnginePoints(before.score)
+  const afterAdvantage = displayEnginePoints(after.score)
+  const beforeMoverAdvantage = move.color === 'B' ? -beforeAdvantage : beforeAdvantage
+  const afterMoverAdvantage = move.color === 'B' ? -afterAdvantage : afterAdvantage
+  const pointLoss = Math.max(0, beforeMoverAdvantage - afterMoverAdvantage) / 100
   let rating = 'blunder'
   if (Number.isFinite(before.score) && Number.isFinite(after.score)) {
     if (pointLoss <= 0.1) rating = isBestMove ? 'best' : 'excellent'
@@ -157,15 +168,21 @@ export function rateMove(before, after, move) {
     else if (drop <= 20) rating = 'mistake'
   }
   if (pointLoss <= 0.1 && drop === 0 && before.onlyWinningLine && isBestMove) rating = 'brilliant'
-  const pointsChange = afterMoverAdvantage - beforeMoverAdvantage
   if (after.winner === move.color) rating = 'winning'
   return {
     rating,
     drop: Number(drop.toFixed(1)),
     isBestMove,
-    pointsChange: Number(pointsChange.toFixed(2)),
-    pointsLost: Number(Math.max(0, -pointsChange).toFixed(2)),
-    pointsGained: Number(Math.max(0, pointsChange).toFixed(2)),
     pointAdvantage: afterAdvantage,
+  }
+}
+
+export function rateOpening(position) {
+  const score = displayEnginePoints(position.score)
+  const distance = Math.abs(score)
+  return {
+    rating: distance < 50 ? 'opening-balanced' : score > 0 ? 'opening-white' : 'opening-black',
+    pointAdvantage: score,
+    balanced: distance < 50,
   }
 }

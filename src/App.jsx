@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDownToLine, ChevronLeft, ChevronRight, CircleHelp, Cpu, FileUp, RotateCcw } from 'lucide-react'
-import { winProbability } from './engine/evaluation.js'
+import { formatEnginePoints, winProbability } from './engine/evaluation.js'
 import { findWinningLine, parseGameText } from './engine/game.js'
 import GomokuBoard from './components/GomokuBoard.jsx'
 import MoveList from './components/MoveList.jsx'
@@ -31,6 +31,15 @@ function formatMoves(moves) {
   return moves.map(({ x, y }) => `${String.fromCharCode(97 + x)}${15 - y}`).join('')
 }
 
+function displayEngineWinner(score) {
+  if (score === 0) return 'Vyrovnané'
+  return score > 0 ? 'Černý' : 'Bílý'
+}
+
+function formatPrincipalVariation(pv) {
+  return (pv ?? []).map(({ x, y }) => `${String.fromCharCode(65 + x)}${15 - y}`).join(' → ')
+}
+
 function App() {
   const [moves, setMoves] = useState([])
   const [gameText, setGameText] = useState('')
@@ -46,112 +55,136 @@ function App() {
   const [gameName, setGameName] = useState('Nová partie')
   const [engineStrength, setEngineStrength] = useState('balanced')
   const [engineConfig, setEngineConfig] = useState(SEARCH_STRENGTHS.balanced)
-  const [tableSizeMb, setTableSizeMb] = useState(512)
+  const [tableSizeMb] = useState(0)
   const [allocatedTableSizeMb, setAllocatedTableSizeMb] = useState(null)
   const [searchProgress, setSearchProgress] = useState(null)
+  const [searchStartedAt, setSearchStartedAt] = useState(null)
+  const [elapsedNow, setElapsedNow] = useState(0)
   const [modeChoicePreference, setModeChoicePreference] = useState(() => {
     if (typeof window === 'undefined') return 'ask'
     return window.localStorage.getItem(MODE_CHOICE_STORAGE_KEY) ?? 'ask'
   })
   const [pendingModeChange, setPendingModeChange] = useState(null)
   const [rememberModeChoice, setRememberModeChoice] = useState(false)
-  const [openingConfig, setOpeningConfig] = useState({ stones: 3, starter: 'B', swapped: false })
+  const [openingConfig, setOpeningConfig] = useState({ stones: 3 })
   const [showRawData, setShowRawData] = useState(false)
   const [rawData, setRawData] = useState('')
   const workerRef = useRef(null)
+  const restartWorkerRef = useRef(() => null)
   const requestIdRef = useRef(0)
   const fileInputRef = useRef(null)
 
-  const openingMoves = useMemo(() => openingConfig.starter === 'B'
-    ? moves
-    : moves.map((move) => ({ ...move, color: move.color === 'B' ? 'W' : 'B' })), [moves, openingConfig.starter])
+  const openingMoves = moves
   const openingMode = useMemo(() => viewMode === 'swap2' ? {
     stones: openingConfig.stones,
-    ownerColor: openingConfig.swapped
-      ? (openingConfig.starter === 'B' ? 'W' : 'B')
-      : openingConfig.starter,
-  } : null, [viewMode, openingConfig.stones, openingConfig.starter, openingConfig.swapped])
+  } : null, [viewMode, openingConfig.stones])
   const analysisMoves = openingMode ? openingMoves : moves
   const visibleMoves = viewMode === 'swap2' ? openingMoves : moves
   const analysisLimits = openingMode ? OPENING_LIMITS : engineConfig
 
   useEffect(() => {
-    const worker = new Worker(new URL('./engine.worker.js', import.meta.url), { type: 'module' })
-    workerRef.current = worker
-    worker.onmessage = ({ data }) => {
-      if (data.type === 'engine') {
-        setEngineMode(data.mode)
-        setEngineLoadError(data.loadError ?? '')
-        setEngineCapabilities(data.capabilities ?? { liveProgress: false, resizableTable: false })
-        return
+    const createWorker = () => {
+      const worker = new Worker(new URL('./engine.worker.js', import.meta.url), { type: 'module' })
+      workerRef.current = worker
+      worker.onmessage = ({ data }) => {
+        if (data.type === 'engine') {
+          setEngineMode(data.mode)
+          setEngineLoadError(data.loadError ?? '')
+          setEngineCapabilities(data.capabilities ?? { liveProgress: false, resizableTable: false })
+          return
+        }
+        if (data.id !== requestIdRef.current) return
+        if (data.type === 'table-size') {
+          setAllocatedTableSizeMb(data.allocatedMb)
+          return
+        }
+        if (data.type === 'search-start') {
+          setSearchProgress(data)
+          setProgress((data.positionIndex / Math.max(data.totalPositions, 1)) * 100)
+          return
+        }
+        if (data.type === 'search-progress') {
+          setSearchProgress(data)
+          setAnalysis((current) => {
+            const positions = current?.positions ? [...current.positions] : []
+            positions[data.positionIndex] = {
+              score: data.score,
+              winPercent: Number(winProbability(data.score).toFixed(1)),
+              pv: data.pv?.length ? data.pv : data.bestMove ? [data.bestMove] : [],
+              onlyWinningLine: false,
+            }
+            return { ...current, positions, ratings: current?.ratings ?? [] }
+          })
+          const depthProgress = Math.min(data.depth / Math.max(data.maxDepth, 1), 0.99)
+          setProgress(Math.min(99, ((data.positionIndex + depthProgress) / Math.max(data.totalPositions, 1)) * 100))
+          return
+        }
+        if (data.type === 'search-position-complete') {
+          setSearchProgress((current) => current?.positionIndex === data.positionIndex ? null : current)
+          setProgress(data.progress)
+          return
+        }
+        if (data.type === 'raw') {
+          setRawData((existing) => `${existing}${data.lines.join('\n')}\n`)
+          return
+        }
+        if (data.type === 'progress') setProgress(data.progress)
+        if (data.type === 'analysis') {
+          setAnalysis(data)
+          setSearchProgress(null)
+          setEngineMode(data.engineMode)
+          setProgress(100)
+        }
+        if (data.type === 'error') setError(data.message)
       }
-      if (data.id !== requestIdRef.current) return
-      if (data.type === 'table-size') {
-        setAllocatedTableSizeMb(data.allocatedMb)
-        return
-      }
-      if (data.type === 'search-start') {
-        setSearchProgress(data)
-        setProgress((data.positionIndex / Math.max(data.totalPositions, 1)) * 100)
-        return
-      }
-      if (data.type === 'search-progress') {
-        setSearchProgress(data)
-        setAnalysis((current) => {
-          const positions = current?.positions ? [...current.positions] : []
-          positions[data.positionIndex] = {
-            score: data.score,
-            winPercent: Number(winProbability(data.score).toFixed(1)),
-            pv: data.bestMove ? [data.bestMove] : [],
-            onlyWinningLine: false,
-          }
-          return { ...current, positions, ratings: current?.ratings ?? [] }
-        })
-        const depthProgress = Math.min(data.depth / Math.max(data.maxDepth, 1), 0.99)
-        setProgress(Math.min(99, ((data.positionIndex + depthProgress) / Math.max(data.totalPositions, 1)) * 100))
-        return
-      }
-      if (data.type === 'search-position-complete') {
-        setSearchProgress((current) => current?.positionIndex === data.positionIndex ? null : current)
-        setProgress(data.progress)
-        return
-      }
-      if (data.type === 'raw') {
-        setRawData((existing) => `${existing}${data.lines.join('\n')}\n`)
-        return
-      }
-      if (data.type === 'progress') setProgress(data.progress)
-      if (data.type === 'analysis') {
-        setAnalysis(data)
-        setSearchProgress(null)
-        setEngineMode(data.engineMode)
-        setProgress(100)
-      }
-      if (data.type === 'error') setError(data.message)
+      worker.onerror = () => setError('Analytický worker se nepodařilo spustit.')
+      return worker
     }
-    worker.onerror = () => setError('Analytický worker se nepodařilo spustit.')
+    restartWorkerRef.current = () => {
+      workerRef.current?.terminate()
+      return createWorker()
+    }
+    createWorker()
     return () => {
-      worker.terminate()
+      restartWorkerRef.current = () => null
+      workerRef.current?.terminate()
       workerRef.current = null
     }
   }, [])
 
   useEffect(() => {
     if (!workerRef.current) return
+    const restartingWorker = requestIdRef.current > 0
+    const worker = restartingWorker ? restartWorkerRef.current() : workerRef.current
+    if (!worker) return
     const id = ++requestIdRef.current
     setAnalysis(null)
     setProgress(0)
     setSearchProgress(null)
+    setSearchStartedAt(Date.now())
+    setElapsedNow(0)
     setRawData('')
     setError('')
-    workerRef.current.postMessage({
-      type: 'analyze',
-      id,
-      moves: analysisMoves,
-      opening: openingMode,
-      limits: { ...analysisLimits, tableSizeMb, requestId: id },
-    })
+    const startTimer = window.setTimeout(() => {
+      if (requestIdRef.current !== id) return
+      worker.postMessage({
+        type: 'analyze',
+        id,
+        moves: analysisMoves,
+        opening: openingMode,
+        limits: { ...analysisLimits, tableSizeMb, requestId: id },
+      })
+    }, restartingWorker ? 250 : 0)
+    return () => window.clearTimeout(startTimer)
   }, [analysisMoves, analysisLimits, openingMode, tableSizeMb])
+  const isAnalysisRunning = progress < 100 && !error
+  useEffect(() => {
+    if (!isAnalysisRunning || searchStartedAt === null) return undefined
+    const updateElapsed = () => setElapsedNow(Date.now() - searchStartedAt)
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 250)
+    return () => window.clearInterval(timer)
+  }, [isAnalysisRunning, searchStartedAt])
 
   const displayedMove = viewMode === 'swap2' ? Math.min(openingConfig.stones, moves.length) : currentMove
   const board = useMemo(() => {
@@ -163,8 +196,7 @@ function App() {
   }, [visibleMoves, displayedMove])
   const currentAnalysis = analysis?.positions?.[displayedMove]
   const displayedWinner = findWinningLine(visibleMoves.slice(0, displayedMove))
-  const openingRating = viewMode === 'swap2' ? analysis?.ratings?.slice(0, openingConfig.stones).find(Boolean) : null
-  const isAnalysisRunning = progress < 100 && !error
+  const openingRating = viewMode === 'swap2' ? analysis?.openingRating : null
 
   function changePosition(nextMove) {
     setCurrentMove(Math.max(0, Math.min(moves.length, nextMove)))
@@ -291,7 +323,8 @@ function App() {
 
   const winPercent = currentAnalysis?.winPercent
   const isCalculating = !error && (searchProgress?.positionIndex === displayedMove || !currentAnalysis)
-  const pvMove = viewMode === 'swap2' ? null : currentAnalysis?.pv?.[0]
+  const pvMove = currentAnalysis?.pv?.[0]
+  const principalVariation = currentAnalysis?.pv ?? []
 
   return (
     <main className="app-shell">
@@ -338,7 +371,7 @@ function App() {
         <section className="board-column">
           <div className="board-topline">
             <div className="game-label"><span className="game-dot" /> <strong>{gameName}</strong><span className="move-count">{viewMode === 'swap2' ? Math.min(moves.length, openingConfig.stones) : moves.length} tahů</span>{displayedWinner && <span className="game-result">{displayedWinner.color === 'B' ? 'Černý' : 'Bílý'} vítězí</span>}</div>
-            {viewMode === 'swap2' ? <span className="opening-tag">{openingConfig.stones} KAMENŮ · {openingConfig.swapped ? 'SWAP' : 'BEZ SWAPU'}</span> : <span className="turn-label">{displayedMove === 0 ? 'Výchozí pozice' : `${displayedMove}. tah`}<span> · {displayedMove % 2 === 0 ? 'na tahu černý' : 'na tahu bílý'}</span></span>}
+            {viewMode === 'swap2' ? <span className="opening-tag">{openingConfig.stones} KAMENŮ</span> : <span className="turn-label">{displayedMove === 0 ? 'Výchozí pozice' : `${displayedMove}. tah`}<span> · {displayedMove % 2 === 0 ? 'na tahu černý' : 'na tahu bílý'}</span></span>}
           </div>
           <GomokuBoard board={board} lastMove={displayedMove > 0 ? visibleMoves[displayedMove - 1] : null} pvMove={pvMove} winningLine={displayedWinner?.line} onCellClick={addMove} onUndo={undoLastMove} interactive={!displayedWinner && (viewMode === 'swap2' ? moves.length < openingConfig.stones : currentMove === moves.length)} />
           <div className="board-controls">
@@ -386,9 +419,7 @@ function App() {
           </nav>
 
           {viewMode === 'swap2' && <section className="opening-controls panel" aria-label="Nastavení zahájení">
-            <label><span>Typ zahájení</span><select value={openingConfig.stones} onChange={(event) => setOpeningConfig((current) => ({ ...current, stones: Number(event.target.value) }))}><option value="3">Swap1 · 3 kameny</option><option value="5">Swap2 · 5 kamenů</option></select></label>
-            <label><span>Zahájil hráč</span><select value={openingConfig.starter} onChange={(event) => setOpeningConfig((current) => ({ ...current, starter: event.target.value }))}><option value="B">Černý</option><option value="W">Bílý</option></select></label>
-            <label className="opening-swap"><input type="checkbox" checked={openingConfig.swapped} onChange={(event) => setOpeningConfig((current) => ({ ...current, swapped: event.target.checked }))} /><span>Druhý hráč vyměnil barvy</span></label>
+            <label><span>Typ zahájení</span><select value={openingConfig.stones} onChange={(event) => setOpeningConfig({ stones: Number(event.target.value) })}><option value="3">Swap1 · 3 kameny</option><option value="5">Swap2 · 5 kamenů</option></select></label>
           </section>}
 
         <div className={`analysis-column${viewMode === 'swap2' ? ' opening-analysis' : ''}`}>
@@ -397,7 +428,7 @@ function App() {
               <div><span className="eyebrow">POZICE PO {displayedMove} TAZÍCH</span><h2>Šance na výhru</h2></div>
               <span className="eval-chip"><Cpu size={14} /> {engineMode === 'wasm' ? 'WASM' : 'CPU'}</span>
             </div>
-            <div className="win-split"><span className="win-side white-side"><span>Bílý</span><strong>{winPercent === undefined ? '—' : (100 - winPercent).toFixed(1)}{winPercent !== undefined && <small>%</small>}</strong></span><div className="split-track"><span style={{ width: `${winPercent === undefined ? 50 : 100 - winPercent}%` }} /></div><span className="win-side black-side"><span>Černý</span><strong>{winPercent === undefined ? '—' : winPercent.toFixed(1)}{winPercent !== undefined && <small>%</small>}</strong></span>{isCalculating && <div className="score-loading-overlay" role="status"><span className="loading-spinner" /><span>Počítám pozici…</span></div>}</div>
+            <div className="win-split"><span className="win-side white-side"><span>Engine body</span><strong>{currentAnalysis?.score === undefined ? '—' : formatEnginePoints(currentAnalysis.score)}</strong></span><div className="split-track"><span style={{ width: `${winPercent === undefined ? 50 : 100 - winPercent}%` }} /></div><span className="win-side black-side"><span>Výhoda</span><strong>{currentAnalysis?.score === undefined ? '—' : displayEngineWinner(currentAnalysis.score)}</strong></span>{isCalculating && <div className="score-loading-overlay" role="status"><span className="loading-spinner" /><span>Počítám pozici…</span></div>}</div>
             {viewMode === 'swap2' ? <div className="opening-limit-summary">Zahájení: hloubka 30 · 120 000 ms / tah</div> : <>
               <div className="engine-controls">
                 <label htmlFor="engine-strength">Nastavení síly</label>
@@ -412,22 +443,8 @@ function App() {
               </div>
             </>}
             <div className="table-size-control">
-              <label htmlFor="table-size">Transpoziční tabulka <strong>{tableSizeMb} MB</strong></label>
-              <input
-                id="table-size"
-                type="range"
-                min="16"
-                max="1024"
-                step="16"
-                value={tableSizeMb}
-                aria-valuetext={`${tableSizeMb} MB`}
-                disabled={!engineCapabilities.resizableTable}
-                onChange={(event) => {
-                  setTableSizeMb(Number(event.target.value))
-                  setAllocatedTableSizeMb(null)
-                }}
-              />
-              <span>{engineMode !== 'wasm' ? 'Dostupné s Rapfi WASM' : !engineCapabilities.resizableTable ? 'WASM je třeba znovu sestavit pro změnu velikosti' : allocatedTableSizeMb === null ? 'Alokace při příštím hledání…' : `Rapfi alokoval ${allocatedTableSizeMb} MB${allocatedTableSizeMb < tableSizeMb ? ' (omezeno pamětí)' : ''}`}</span>
+              <label>Transpoziční tabulka <strong>Automaticky</strong></label>
+              <span>{engineMode !== 'wasm' ? 'Dostupné s Rapfi WASM' : !engineCapabilities.resizableTable ? 'WASM je třeba znovu sestavit pro automatickou velikost' : allocatedTableSizeMb === null ? 'Zjišťuji bezpečnou velikost…' : `Rapfi alokoval ${allocatedTableSizeMb} MB`}</span>
             </div>
             <div className="raw-toggle-row">
               <button className="raw-toggle" type="button" aria-expanded={showRawData} onClick={() => setShowRawData((visible) => !visible)}>
@@ -437,18 +454,18 @@ function App() {
             </div>
             {showRawData && <pre className="raw-engine-data" aria-live="polite">{rawData || 'Čekám na výstup enginu…'}</pre>}
             {viewMode === 'swap2' && moves.length < openingConfig.stones && <div className="recommendation"><span className="recommendation-kicker">HODNOCENÍ ZAHÁJENÍ</span><strong>Umístěte ještě {openingConfig.stones - moves.length} {openingConfig.stones - moves.length === 1 ? 'kámen' : 'kameny'}</strong><p>Celé zahájení se vyhodnotí společně po dokončení.</p></div>}
-            {viewMode === 'swap2' && openingRating && <div className="opening-evaluation"><span className="recommendation-kicker">SPOLEČNÉ HODNOCENÍ ZAHÁJENÍ</span><strong>{ratingLabels[openingRating.rating] ?? 'Vyhodnoceno'}</strong><p>{openingRating.pointsChange >= 0 ? 'Zisk' : 'Ztráta'} hráče po výměně: {Math.abs(openingRating.pointsChange).toFixed(1)} bodu · výhoda černého {openingRating.pointAdvantage >= 0 ? '+' : ''}{openingRating.pointAdvantage.toFixed(1)} bodu</p></div>}
-            {viewMode === 'full' && pvMove && <div className="pv-callout"><span className="pv-mark">PV</span><div><strong>Nejlepší pokračování</strong><p>{String.fromCharCode(65 + pvMove.x)}{15 - pvMove.y} · po tahu {displayedMove}</p></div><ArrowDownToLine size={16} /></div>}
+            {viewMode === 'swap2' && openingRating && <span className="opening-rating-inline">{openingRating.balanced ? 'Vyvážené zahájení' : `Výhoda ${openingRating.pointAdvantage > 0 ? 'bílého' : 'černého'}: ${formatEnginePoints(openingRating.pointAdvantage, true)}`}</span>}
+            {principalVariation.length > 0 && <div className="pv-callout"><span className="pv-mark">PV</span><div><strong>Nejlepší cesta enginu</strong><p>{formatPrincipalVariation(principalVariation)} · po tahu {displayedMove}</p></div><ArrowDownToLine size={16} /></div>}
             {isAnalysisRunning && <>
               <div className="analysis-progress"><span style={{ width: `${progress}%` }} /></div>
-              {searchProgress && <div className="analysis-progress-meta">
-                {searchProgress.elapsedMs === undefined ? <span>{engineCapabilities.liveProgress ? 'Příprava vyhledávání…' : 'Průběžná data vyžadují nový WASM build'}</span> : <>
+              <div className="analysis-progress-meta">
+                {searchProgress?.elapsedMs === undefined ? <span>{engineCapabilities.liveProgress ? 'Příprava vyhledávání…' : 'Výpočet běží…'} {((searchProgress?.elapsedMs ?? elapsedNow) / 1000).toFixed(1)} s</span> : <>
                   <span>Hloubka {searchProgress.depth}/{searchProgress.maxDepth}</span>
                   <span>{Math.round(searchProgress.nodes).toLocaleString('cs-CZ')} uzlů</span>
                   <span>{(searchProgress.elapsedMs / 1000).toFixed(1)} s</span>
                 </>}
-                <span>Pozice {searchProgress.positionIndex + 1}/{searchProgress.totalPositions}</span>
-              </div>}
+                <span>Pozice {(searchProgress?.positionIndex ?? displayedMove) + 1}/{searchProgress?.totalPositions ?? analysisMoves.length + 1}</span>
+              </div>
             </>}
           </div>
 

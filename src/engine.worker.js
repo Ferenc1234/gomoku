@@ -1,7 +1,12 @@
-import { analyzeLocalPosition, rateMove, winProbability } from './engine/evaluation.js'
+import { analyzeLocalPosition, rateMove, rateOpening, winProbability } from './engine/evaluation.js'
 import { findWinningLine } from './engine/game.js'
 
 const SIZE = 15
+function automaticTableSizeMb() {
+  const deviceMemoryGb = Number(self.navigator?.deviceMemory) || 4
+  const quarterMemoryMb = deviceMemoryGb * 1024 * 0.25
+  return Math.min(512, Math.max(64, Math.floor(quarterMemoryMb / 16) * 16))
+}
 let enginePromise
 let wasmLoadError = 'Soubor rapfi.js nebo rapfi-simd128.js se nepodařilo načíst.'
 const wasmModulePromise = (async () => {
@@ -184,26 +189,38 @@ self.onmessage = async ({ data }) => {
     const limits = {
       depth: Number(data.limits?.depth) || 10,
       timeMs: Number(data.limits?.timeMs) || 750,
-      tableSizeMb: Number(data.limits?.tableSizeMb) || 512,
+      tableSizeMb: Number(data.limits?.tableSizeMb) || automaticTableSizeMb(),
       requestId: data.id,
       totalPositions: analysisMoves.length + 1,
     }
-    const positions = []
-    const ratings = []
+    const positions = Array(data.opening ? analysisMoves.length + 1 : 1)
+    const ratings = data.opening ? Array(analysisMoves.length).fill(null) : []
     const board = createBoard([])
-    const initialPosition = await analyzePosition(engine, [], board, 'B', limits, 0)
+    const initialPosition = data.opening
+      ? { score: 0, winPercent: 50, pv: [], onlyWinningLine: false, rawLines: [] }
+      : await analyzePosition(engine, [], board, 'B', limits, 0)
     if (activeRequestId !== data.id) return
-    self.postMessage({
+    if (!data.opening) self.postMessage({
       type: 'search-position-complete',
       id: data.id,
       positionIndex: 0,
       progress: Math.round((1 / limits.totalPositions) * 100),
     })
-    positions.push(initialPosition)
-    self.postMessage({ type: 'raw', id: data.id, lines: initialPosition.rawLines })
-    for (let index = 0; index < analysisMoves.length; index += 1) {
+    positions[0] = initialPosition
+    if (!data.opening) self.postMessage({ type: 'raw', id: data.id, lines: initialPosition.rawLines })
+    const indexes = data.opening
+      ? (analysisMoves.length ? [analysisMoves.length - 1] : [])
+      : analysisMoves.map((_move, index) => index)
+    for (const index of indexes) {
       const move = analysisMoves[index]
-      board[move.y][move.x] = move.color
+      if (data.opening) {
+        for (let boardIndex = 0; boardIndex <= index; boardIndex += 1) {
+          const openingMove = analysisMoves[boardIndex]
+          board[openingMove.y][openingMove.x] = openingMove.color
+        }
+      } else {
+        board[move.y][move.x] = move.color
+      }
       const positionMoves = analysisMoves.slice(0, index + 1)
       const sideToMove = move.color === 'B' ? 'W' : 'B'
       const winningLine = findWinningLine(positionMoves)
@@ -224,19 +241,20 @@ self.onmessage = async ({ data }) => {
         positionIndex: index + 1,
         progress: Math.round(((index + 2) / limits.totalPositions) * 100),
       })
-      positions.push(position)
-      if (data.opening) {
-        ratings.push(index + 1 === Number(data.opening.stones) || winningLine
-          ? rateMove(initialPosition, position, { ...move, color: data.opening.ownerColor })
-          : null)
-      } else {
-        ratings.push(rateMove(positions[index], position, move))
-      }
+      positions[index + 1] = position
+      if (!data.opening) ratings.push(rateMove(positions[index], position, move))
       self.postMessage({ type: 'raw', id: data.id, lines: position.rawLines })
       self.postMessage({ type: 'progress', id: data.id, progress: Math.round(((index + 2) / limits.totalPositions) * 100) })
       if (winningLine) break
     }
-    if (activeRequestId === data.id) self.postMessage({ type: 'analysis', id: data.id, positions, ratings, engineMode })
+    if (activeRequestId === data.id) self.postMessage({
+      type: 'analysis',
+      id: data.id,
+      positions,
+      ratings,
+      openingRating: data.opening && positions[analysisMoves.length] ? rateOpening(positions[analysisMoves.length]) : null,
+      engineMode,
+    })
   } catch (error) {
     self.postMessage({ type: 'error', id: data.id, message: error instanceof Error ? error.message : 'Analýza selhala.' })
   }
