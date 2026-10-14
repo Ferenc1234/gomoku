@@ -61,9 +61,15 @@ function EvaluationGraph({ analyses, viewMode, currentMove }) {
       }
     })
     
-  const currentMax = Math.max(...graphData.map(({ enginePoints }) => Math.abs(enginePoints)), 0)
-  // Použití defaultní mapované hodnoty 100, aby prázdný graf nevypsal 0 třikrát na osu Y
-  const graphMax = currentMax === 0 ? 100 : currentMax
+  // Výpočet maxima z CELÉHO pole analýz (nikoliv jen ze slice), 
+  // aby se rozsah osy Y neměnil při přehrávání tahů a graf se "nevrtěl".
+  const globalMax = Math.max(
+    ...analyses
+      .filter((analysis) => Number.isFinite(analysis?.score))
+      .map((analysis) => Math.abs(calculateLogHeight(displayEnginePoints(analysis.score)))),
+    0
+  )
+  const graphMax = globalMax === 0 ? 100 : globalMax
 
   return (
     <section className="panel graph-panel" aria-label="Graf hodnocení">
