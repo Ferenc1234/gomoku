@@ -33,4 +33,4 @@ Po instalaci/aktivaci Emscripten SDK spusťte `bash scripts/build-wasm.sh`. Buil
 
 ## GitHub Pages
 
-Workflow `.github/workflows/deploy.yml` sestaví aplikaci a publikuje ji při pushi do `main`. Vite nastaví base path `/gomoku/`; pro jiný název repozitáře upravte cestu v `vite.config.js`.
+Workflow `.github/workflows/deploy.yml` sestaví aplikaci a publikuje ji při pushi do `main`. Při prvním nasazení otevřete v GitHubu **Settings → Pages** a nastavte **Build and deployment → Source** na **GitHub Actions**. Workflow si vezme base path z `actions/configure-pages`, takže funguje i po změně názvu repozitáře.
