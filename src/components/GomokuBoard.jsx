@@ -5,7 +5,7 @@ function coordinateLabel(x, y) {
   return `${LETTERS[x]}${15 - y}`
 }
 
-function GomokuBoard({ board, lastMove, pvMove, onCellClick, onUndo, interactive }) {
+function GomokuBoard({ board, lastMove, pvMove, winningLine, onCellClick, onUndo, interactive }) {
   return (
     <div className="board-stage" onContextMenu={(event) => { event.preventDefault(); onUndo() }}>
       <div className="axis-top" aria-hidden="true">{Array.from({ length: 15 }, (_, x) => <span key={x}>{LETTERS[x]}</span>)}</div>
@@ -30,6 +30,16 @@ function GomokuBoard({ board, lastMove, pvMove, onCellClick, onUndo, interactive
               </button>
             )
           }))}
+          {winningLine?.length === 5 && (
+            <svg className="winning-line" viewBox="0 0 100 100" aria-hidden="true">
+              <line
+                x1={`${(winningLine[0].x / 14) * 100}%`}
+                y1={`${(winningLine[0].y / 14) * 100}%`}
+                x2={`${(winningLine[4].x / 14) * 100}%`}
+                y2={`${(winningLine[4].y / 14) * 100}%`}
+              />
+            </svg>
+          )}
         </div>
       </div>
     </div>

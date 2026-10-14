@@ -1,16 +1,21 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDownToLine, ChevronLeft, ChevronRight, CircleHelp, Cpu, FileUp, RotateCcw } from 'lucide-react'
-import { parseGameText } from './engine/game.js'
+import { winProbability } from './engine/evaluation.js'
+import { findWinningLine, parseGameText } from './engine/game.js'
 import GomokuBoard from './components/GomokuBoard.jsx'
 import MoveList from './components/MoveList.jsx'
 import './App.css'
 
 const EvaluationGraph = lazy(() => import('./components/EvaluationGraph.jsx'))
 const SEARCH_STRENGTHS = {
-  quick: { label: 'Rychlá', depth: 6, timeMs: 250 },
-  balanced: { label: 'Vyvážená', depth: 10, timeMs: 750 },
-  strong: { label: 'Silná', depth: 14, timeMs: 1500 },
+  quick: { label: 'Rychlá', depth: 18, timeMs: 10000 },
+  balanced: { label: 'Vyvážená', depth: 24, timeMs: 30000 },
+  strong: { label: 'Silná', depth: 28, timeMs: 60000 },
+  maximum: { label: 'Maximální', depth: 30, timeMs: 120000 },
 }
+const OPENING_LIMITS = { depth: 30, timeMs: 120000 }
+
+const MODE_CHOICE_STORAGE_KEY = 'gomoku-mode-choice'
 
 const ratingLabels = {
   brilliant: 'Zářivý',
@@ -19,16 +24,11 @@ const ratingLabels = {
   inaccuracy: 'Nepřesnost',
   mistake: 'Chyba',
   blunder: 'Hrubá chyba',
-}
-
-function getRecommendation(winPercent) {
-  if (winPercent > 60) return { title: 'Volit černou', detail: 'Pozice dává černému jasnou výhodu.', tone: 'black' }
-  if (winPercent < 40) return { title: 'Volit bílou', detail: 'Pozice dává bílému jasnou výhodu.', tone: 'white' }
-  return { title: 'Položit další 2 kameny', detail: 'Pozice je vyrovnaná. Pokračujte ve Swap2.', tone: 'even' }
+  winning: 'Vítězný tah',
 }
 
 function formatMoves(moves) {
-  return moves.map(({ x, y, color }) => `${x},${y},${color === 'B' ? 1 : 2}`).join('\n')
+  return moves.map(({ x, y }) => `${String.fromCharCode(97 + x)}${15 - y}`).join('')
 }
 
 function App() {
@@ -40,15 +40,40 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState('')
   const [engineMode, setEngineMode] = useState('starting')
+  const [engineCapabilities, setEngineCapabilities] = useState({ liveProgress: false, resizableTable: false })
   const [engineLoadError, setEngineLoadError] = useState('')
   const [showHelp, setShowHelp] = useState(false)
   const [gameName, setGameName] = useState('Nová partie')
   const [engineStrength, setEngineStrength] = useState('balanced')
+  const [engineConfig, setEngineConfig] = useState(SEARCH_STRENGTHS.balanced)
+  const [tableSizeMb, setTableSizeMb] = useState(512)
+  const [allocatedTableSizeMb, setAllocatedTableSizeMb] = useState(null)
+  const [searchProgress, setSearchProgress] = useState(null)
+  const [modeChoicePreference, setModeChoicePreference] = useState(() => {
+    if (typeof window === 'undefined') return 'ask'
+    return window.localStorage.getItem(MODE_CHOICE_STORAGE_KEY) ?? 'ask'
+  })
+  const [pendingModeChange, setPendingModeChange] = useState(null)
+  const [rememberModeChoice, setRememberModeChoice] = useState(false)
+  const [openingConfig, setOpeningConfig] = useState({ stones: 3, starter: 'B', swapped: false })
   const [showRawData, setShowRawData] = useState(false)
   const [rawData, setRawData] = useState('')
   const workerRef = useRef(null)
   const requestIdRef = useRef(0)
   const fileInputRef = useRef(null)
+
+  const openingMoves = useMemo(() => openingConfig.starter === 'B'
+    ? moves
+    : moves.map((move) => ({ ...move, color: move.color === 'B' ? 'W' : 'B' })), [moves, openingConfig.starter])
+  const openingMode = useMemo(() => viewMode === 'swap2' ? {
+    stones: openingConfig.stones,
+    ownerColor: openingConfig.swapped
+      ? (openingConfig.starter === 'B' ? 'W' : 'B')
+      : openingConfig.starter,
+  } : null, [viewMode, openingConfig.stones, openingConfig.starter, openingConfig.swapped])
+  const analysisMoves = openingMode ? openingMoves : moves
+  const visibleMoves = viewMode === 'swap2' ? openingMoves : moves
+  const analysisLimits = openingMode ? OPENING_LIMITS : engineConfig
 
   useEffect(() => {
     const worker = new Worker(new URL('./engine.worker.js', import.meta.url), { type: 'module' })
@@ -57,9 +82,40 @@ function App() {
       if (data.type === 'engine') {
         setEngineMode(data.mode)
         setEngineLoadError(data.loadError ?? '')
+        setEngineCapabilities(data.capabilities ?? { liveProgress: false, resizableTable: false })
         return
       }
       if (data.id !== requestIdRef.current) return
+      if (data.type === 'table-size') {
+        setAllocatedTableSizeMb(data.allocatedMb)
+        return
+      }
+      if (data.type === 'search-start') {
+        setSearchProgress(data)
+        setProgress((data.positionIndex / Math.max(data.totalPositions, 1)) * 100)
+        return
+      }
+      if (data.type === 'search-progress') {
+        setSearchProgress(data)
+        setAnalysis((current) => {
+          const positions = current?.positions ? [...current.positions] : []
+          positions[data.positionIndex] = {
+            score: data.score,
+            winPercent: Number(winProbability(data.score).toFixed(1)),
+            pv: data.bestMove ? [data.bestMove] : [],
+            onlyWinningLine: false,
+          }
+          return { ...current, positions, ratings: current?.ratings ?? [] }
+        })
+        const depthProgress = Math.min(data.depth / Math.max(data.maxDepth, 1), 0.99)
+        setProgress(Math.min(99, ((data.positionIndex + depthProgress) / Math.max(data.totalPositions, 1)) * 100))
+        return
+      }
+      if (data.type === 'search-position-complete') {
+        setSearchProgress((current) => current?.positionIndex === data.positionIndex ? null : current)
+        setProgress(data.progress)
+        return
+      }
       if (data.type === 'raw') {
         setRawData((existing) => `${existing}${data.lines.join('\n')}\n`)
         return
@@ -67,6 +123,7 @@ function App() {
       if (data.type === 'progress') setProgress(data.progress)
       if (data.type === 'analysis') {
         setAnalysis(data)
+        setSearchProgress(null)
         setEngineMode(data.engineMode)
         setProgress(100)
       }
@@ -84,38 +141,43 @@ function App() {
     const id = ++requestIdRef.current
     setAnalysis(null)
     setProgress(0)
+    setSearchProgress(null)
     setRawData('')
     setError('')
     workerRef.current.postMessage({
       type: 'analyze',
       id,
-      moves,
-      limits: SEARCH_STRENGTHS[engineStrength],
+      moves: analysisMoves,
+      opening: openingMode,
+      limits: { ...analysisLimits, tableSizeMb, requestId: id },
     })
-  }, [moves, engineStrength])
+  }, [analysisMoves, analysisLimits, openingMode, tableSizeMb])
 
-  const displayedMove = viewMode === 'swap2' ? Math.min(3, moves.length) : currentMove
+  const displayedMove = viewMode === 'swap2' ? Math.min(openingConfig.stones, moves.length) : currentMove
   const board = useMemo(() => {
     const cells = Array.from({ length: 15 }, () => Array(15).fill(null))
-    moves.slice(0, displayedMove).forEach(({ x, y, color }) => {
+    visibleMoves.slice(0, displayedMove).forEach(({ x, y, color }) => {
       if (cells[y]?.[x] === null) cells[y][x] = color
     })
     return cells
-  }, [moves, displayedMove])
+  }, [visibleMoves, displayedMove])
   const currentAnalysis = analysis?.positions?.[displayedMove]
-  const recommendation = currentAnalysis ? getRecommendation(currentAnalysis.winPercent) : null
-  const isBusy = !analysis && progress < 100
+  const displayedWinner = findWinningLine(visibleMoves.slice(0, displayedMove))
+  const openingRating = viewMode === 'swap2' ? analysis?.ratings?.slice(0, openingConfig.stones).find(Boolean) : null
+  const isAnalysisRunning = progress < 100 && !error
 
   function changePosition(nextMove) {
     setCurrentMove(Math.max(0, Math.min(moves.length, nextMove)))
   }
 
   function addMove(x, y) {
+    if (findWinningLine(moves)) return
     if (moves.length >= 225) return
-    if (viewMode === 'swap2' && moves.length >= 3) return
+    if (viewMode === 'swap2' && moves.length >= openingConfig.stones) return
     if (viewMode !== 'swap2' && currentMove !== moves.length) return
     if (moves.some((move) => move.x === x && move.y === y)) return
-    const nextMoves = [...moves, { x, y, color: moves.length % 2 === 0 ? 'B' : 'W' }]
+    const nextColor = moves.length % 2 === 0 ? 'B' : 'W'
+    const nextMoves = [...moves, { x, y, color: nextColor }]
     setMoves(nextMoves)
     setGameText(formatMoves(nextMoves))
     setCurrentMove(nextMoves.length)
@@ -140,11 +202,14 @@ function App() {
     }
     try {
       const parsed = parseGameText(value)
-      setMoves(parsed)
-      setCurrentMove(parsed.length)
+      const winningLine = findWinningLine(parsed)
+      const playableMoves = winningLine ? parsed.slice(0, winningLine.moveIndex + 1) : parsed
+      setMoves(playableMoves)
+      setCurrentMove(playableMoves.length)
+      if (playableMoves.length !== parsed.length) setGameText(formatMoves(playableMoves))
       setViewMode('full')
       setGameName('Vložená partie')
-      setError('')
+      setError(playableMoves.length !== parsed.length ? 'Tahům po vítězné pětici se nepřihlíží.' : '')
     } catch (parseError) {
       setError(parseError.message)
     }
@@ -155,12 +220,14 @@ function App() {
     if (!file) return
     try {
       const parsed = parseGameText(await file.text())
-      setMoves(parsed)
-      setGameText(formatMoves(parsed))
-      setCurrentMove(parsed.length)
+      const winningLine = findWinningLine(parsed)
+      const playableMoves = winningLine ? parsed.slice(0, winningLine.moveIndex + 1) : parsed
+      setMoves(playableMoves)
+      setGameText(formatMoves(playableMoves))
+      setCurrentMove(playableMoves.length)
       setViewMode('full')
       setGameName(file.name.replace(/\.(sgf|txt|piskvork)$/i, ''))
-      setError('')
+      setError(playableMoves.length !== parsed.length ? 'Tahům po vítězné pětici se nepřihlíží.' : '')
     } catch (parseError) {
       setError(parseError.message)
     }
@@ -176,8 +243,55 @@ function App() {
     setError('')
   }
 
-  const winPercent = currentAnalysis?.winPercent ?? 50
-  const pvMove = viewMode === 'partial' ? currentAnalysis?.pv?.[0] : null
+  function handleModeChange(nextMode) {
+    if (nextMode === viewMode) return
+    if (!moves.length) {
+      setViewMode(nextMode)
+      return
+    }
+    if (modeChoicePreference === 'keep') {
+      setViewMode(nextMode)
+      return
+    }
+    if (modeChoicePreference === 'new') {
+      resetGame()
+      setViewMode(nextMode)
+      return
+    }
+    setRememberModeChoice(false)
+    setPendingModeChange(nextMode)
+  }
+
+  function confirmModeChange(action) {
+    if (!pendingModeChange) return
+    if (rememberModeChoice) {
+      const preference = action === 'keep' ? 'keep' : 'new'
+      window.localStorage.setItem(MODE_CHOICE_STORAGE_KEY, preference)
+      setModeChoicePreference(preference)
+    }
+    if (action === 'new') resetGame()
+    setViewMode(pendingModeChange)
+    setPendingModeChange(null)
+    setRememberModeChoice(false)
+  }
+
+  function updateEngineConfig(field, value) {
+    const parsedValue = Number(value)
+    setEngineStrength('custom')
+    setEngineConfig((current) => ({
+      ...current,
+      [field]: Number.isFinite(parsedValue) ? parsedValue : 0,
+    }))
+  }
+
+  function updateEngineStrength(value) {
+    setEngineStrength(value)
+    if (value !== 'custom') setEngineConfig(SEARCH_STRENGTHS[value])
+  }
+
+  const winPercent = currentAnalysis?.winPercent
+  const isCalculating = !error && (searchProgress?.positionIndex === displayedMove || !currentAnalysis)
+  const pvMove = viewMode === 'swap2' ? null : currentAnalysis?.pv?.[0]
 
   return (
     <main className="app-shell">
@@ -220,49 +334,13 @@ function App() {
         </div>
       </header>
 
-      <section className="page-heading" id="top">
-        <div>
-          <span className="eyebrow">ANALÝZA V PROHLÍŽEČI · SOUKROMÍ NA PRVNÍM MÍSTĚ</span>
-          <h1>Rozbor partie</h1>
-        </div>
-        <div className="heading-actions">
-          <button className="button button-subtle" type="button" onClick={resetGame}><RotateCcw size={15} /> Nová partie</button>
-          <button className="button button-primary" type="button" onClick={() => fileInputRef.current?.click()}><FileUp size={16} /> Importovat partii</button>
-          <input ref={fileInputRef} className="visually-hidden" type="file" accept=".sgf,.txt,.piskvork,text/plain" onChange={loadFile} />
-        </div>
-      </section>
-
-      {error && <div className="error-banner" role="alert">{error}</div>}
-
-      <section className="game-input panel">
-        <div className="game-input-heading">
-          <label htmlFor="game-text">Zápis partie <span>SGF nebo souřadnice x,y,hráč</span></label>
-          <span className="game-input-count">{moves.length} {moves.length === 1 ? 'tah' : 'tahů'}</span>
-        </div>
-        <textarea
-          id="game-text"
-          value={gameText}
-          onChange={(event) => updateGameText(event.target.value)}
-          placeholder="Vložte SGF nebo zadejte tahy, například: 7,7,1&#10;8,7,2"
-          rows={3}
-          spellCheck={false}
-          aria-label="SGF nebo textový zápis tahů"
-        />
-      </section>
-
-      <nav className="mode-tabs" aria-label="Režim analýzy">
-        <button type="button" className={viewMode === 'full' ? 'active' : ''} onClick={() => setViewMode('full')}>Celá partie</button>
-        <button type="button" className={viewMode === 'partial' ? 'active' : ''} onClick={() => setViewMode('partial')}>Aktuální pozice</button>
-        <button type="button" className={viewMode === 'swap2' ? 'active' : ''} onClick={() => setViewMode('swap2')}>Swap2 · úvod</button>
-      </nav>
-
-      <div className="analysis-layout">
+      <div className="workspace-layout">
         <section className="board-column">
           <div className="board-topline">
-            <div className="game-label"><span className="game-dot" /> <strong>{gameName}</strong><span className="move-count">{moves.length} tahů</span></div>
-            {viewMode === 'swap2' ? <span className="opening-tag">3 KAMENY</span> : <span className="turn-label">{displayedMove === 0 ? 'Výchozí pozice' : `${displayedMove}. tah`}<span> · {displayedMove % 2 === 0 ? 'na tahu černý' : 'na tahu bílý'}</span></span>}
+            <div className="game-label"><span className="game-dot" /> <strong>{gameName}</strong><span className="move-count">{viewMode === 'swap2' ? Math.min(moves.length, openingConfig.stones) : moves.length} tahů</span>{displayedWinner && <span className="game-result">{displayedWinner.color === 'B' ? 'Černý' : 'Bílý'} vítězí</span>}</div>
+            {viewMode === 'swap2' ? <span className="opening-tag">{openingConfig.stones} KAMENŮ · {openingConfig.swapped ? 'SWAP' : 'BEZ SWAPU'}</span> : <span className="turn-label">{displayedMove === 0 ? 'Výchozí pozice' : `${displayedMove}. tah`}<span> · {displayedMove % 2 === 0 ? 'na tahu černý' : 'na tahu bílý'}</span></span>}
           </div>
-          <GomokuBoard board={board} lastMove={displayedMove > 0 ? moves[displayedMove - 1] : null} pvMove={pvMove} onCellClick={addMove} onUndo={undoLastMove} interactive={viewMode === 'swap2' ? moves.length < 3 : currentMove === moves.length} />
+          <GomokuBoard board={board} lastMove={displayedMove > 0 ? visibleMoves[displayedMove - 1] : null} pvMove={pvMove} winningLine={displayedWinner?.line} onCellClick={addMove} onUndo={undoLastMove} interactive={!displayedWinner && (viewMode === 'swap2' ? moves.length < openingConfig.stones : currentMove === moves.length)} />
           <div className="board-controls">
             <button className="icon-button" type="button" title="Předchozí tah" aria-label="Předchozí tah" onClick={() => changePosition(displayedMove - 1)} disabled={viewMode === 'swap2' || displayedMove === 0}><ChevronLeft size={19} /></button>
             <div className="move-scrubber"><span>0</span><input aria-label="Vybraný tah" type="range" min="0" max={moves.length} value={displayedMove} disabled={viewMode === 'swap2'} onChange={(event) => changePosition(Number(event.target.value))} /><span>{moves.length}</span></div>
@@ -271,39 +349,134 @@ function App() {
           <div className="board-footnote"><span><span className="footnote-stone black-stone" /> Černý</span><span><span className="footnote-stone white-stone" /> Bílý</span><span className="pv-legend">Zvýrazněný kruh = doporučení enginu</span></div>
         </section>
 
-        <section className="analysis-column">
+        <section className="workspace-side">
+          <section className="page-heading" id="top">
+            <div>
+              <span className="eyebrow">ANALÝZA V PROHLÍŽEČI · SOUKROMÍ NA PRVNÍM MÍSTĚ</span>
+              <h1>Rozbor partie</h1>
+            </div>
+            <div className="heading-actions">
+              <button className="button button-subtle" type="button" onClick={resetGame}><RotateCcw size={15} /> Nová partie</button>
+              <button className="button button-primary" type="button" onClick={() => fileInputRef.current?.click()}><FileUp size={16} /> Importovat partii</button>
+              <input ref={fileInputRef} className="visually-hidden" type="file" accept=".sgf,.txt,.piskvork,text/plain" onChange={loadFile} />
+            </div>
+          </section>
+
+          {error && <div className="error-banner" role="alert">{error}</div>}
+
+          <section className="game-input panel">
+            <div className="game-input-heading">
+              <label htmlFor="game-text">Zápis partie <span>SGF nebo souřadnice g7j11k7</span></label>
+              <span className="game-input-count">{moves.length} {moves.length === 1 ? 'tah' : 'tahů'}</span>
+            </div>
+            <textarea
+              id="game-text"
+              value={gameText}
+              onChange={(event) => updateGameText(event.target.value)}
+              placeholder="g7j11k7g10i5"
+              rows={3}
+              spellCheck={false}
+              aria-label="SGF nebo kompaktní zápis tahů"
+            />
+          </section>
+
+          <nav className="mode-tabs" aria-label="Režim analýzy">
+            <button type="button" className={viewMode === 'full' ? 'active' : ''} onClick={() => handleModeChange('full')}>Celá partie</button>
+            <button type="button" className={viewMode === 'swap2' ? 'active' : ''} onClick={() => handleModeChange('swap2')}>Swap2 · úvod</button>
+          </nav>
+
+          {viewMode === 'swap2' && <section className="opening-controls panel" aria-label="Nastavení zahájení">
+            <label><span>Typ zahájení</span><select value={openingConfig.stones} onChange={(event) => setOpeningConfig((current) => ({ ...current, stones: Number(event.target.value) }))}><option value="3">Swap1 · 3 kameny</option><option value="5">Swap2 · 5 kamenů</option></select></label>
+            <label><span>Zahájil hráč</span><select value={openingConfig.starter} onChange={(event) => setOpeningConfig((current) => ({ ...current, starter: event.target.value }))}><option value="B">Černý</option><option value="W">Bílý</option></select></label>
+            <label className="opening-swap"><input type="checkbox" checked={openingConfig.swapped} onChange={(event) => setOpeningConfig((current) => ({ ...current, swapped: event.target.checked }))} /><span>Druhý hráč vyměnil barvy</span></label>
+          </section>}
+
+        <div className={`analysis-column${viewMode === 'swap2' ? ' opening-analysis' : ''}`}>
           <div className="panel evaluation-panel">
             <div className="panel-heading evaluation-heading">
               <div><span className="eyebrow">POZICE PO {displayedMove} TAZÍCH</span><h2>Šance na výhru</h2></div>
               <span className="eval-chip"><Cpu size={14} /> {engineMode === 'wasm' ? 'WASM' : 'CPU'}</span>
             </div>
-            <div className="win-split"><span className="win-side white-side"><span>Bílý</span><strong>{(100 - winPercent).toFixed(1)}<small>%</small></strong></span><div className="split-track"><span style={{ width: `${100 - winPercent}%` }} /></div><span className="win-side black-side"><span>Černý</span><strong>{winPercent.toFixed(1)}<small>%</small></strong></span></div>
-            <div className="engine-controls">
-              <label htmlFor="engine-strength">Nastavení síly</label>
-              <select id="engine-strength" value={engineStrength} onChange={(event) => setEngineStrength(event.target.value)}>
-                {Object.entries(SEARCH_STRENGTHS).map(([value, setting]) => <option key={value} value={value}>{setting.label} · hloubka {setting.depth}</option>)}
-              </select>
+            <div className="win-split"><span className="win-side white-side"><span>Bílý</span><strong>{winPercent === undefined ? '—' : (100 - winPercent).toFixed(1)}{winPercent !== undefined && <small>%</small>}</strong></span><div className="split-track"><span style={{ width: `${winPercent === undefined ? 50 : 100 - winPercent}%` }} /></div><span className="win-side black-side"><span>Černý</span><strong>{winPercent === undefined ? '—' : winPercent.toFixed(1)}{winPercent !== undefined && <small>%</small>}</strong></span>{isCalculating && <div className="score-loading-overlay" role="status"><span className="loading-spinner" /><span>Počítám pozici…</span></div>}</div>
+            {viewMode === 'swap2' ? <div className="opening-limit-summary">Zahájení: hloubka 30 · 120 000 ms / tah</div> : <>
+              <div className="engine-controls">
+                <label htmlFor="engine-strength">Nastavení síly</label>
+                <select id="engine-strength" value={engineStrength} onChange={(event) => updateEngineStrength(event.target.value)}>
+                  {Object.entries(SEARCH_STRENGTHS).map(([value, setting]) => <option key={value} value={value}>{setting.label} · hloubka {setting.depth}</option>)}
+                  <option value="custom">Vlastní nastavení</option>
+                </select>
+              </div>
+              <div className="engine-parameter-grid">
+                <label><span>Hloubka</span><input type="number" min="1" max="99" value={engineConfig.depth} onChange={(event) => updateEngineConfig('depth', event.target.value)} /></label>
+                <label><span>Čas / tah (ms)</span><input type="number" min="50" max="120000" step="50" value={engineConfig.timeMs} onChange={(event) => updateEngineConfig('timeMs', event.target.value)} /></label>
+              </div>
+            </>}
+            <div className="table-size-control">
+              <label htmlFor="table-size">Transpoziční tabulka <strong>{tableSizeMb} MB</strong></label>
+              <input
+                id="table-size"
+                type="range"
+                min="16"
+                max="1024"
+                step="16"
+                value={tableSizeMb}
+                aria-valuetext={`${tableSizeMb} MB`}
+                disabled={!engineCapabilities.resizableTable}
+                onChange={(event) => {
+                  setTableSizeMb(Number(event.target.value))
+                  setAllocatedTableSizeMb(null)
+                }}
+              />
+              <span>{engineMode !== 'wasm' ? 'Dostupné s Rapfi WASM' : !engineCapabilities.resizableTable ? 'WASM je třeba znovu sestavit pro změnu velikosti' : allocatedTableSizeMb === null ? 'Alokace při příštím hledání…' : `Rapfi alokoval ${allocatedTableSizeMb} MB${allocatedTableSizeMb < tableSizeMb ? ' (omezeno pamětí)' : ''}`}</span>
             </div>
             <div className="raw-toggle-row">
               <button className="raw-toggle" type="button" aria-expanded={showRawData} onClick={() => setShowRawData((visible) => !visible)}>
                 {showRawData ? 'Skrýt raw data enginu' : 'Zobrazit raw data enginu'}
               </button>
-              {engineStrength && <span>{SEARCH_STRENGTHS[engineStrength].timeMs} ms / tah</span>}
+              <span>{analysisLimits.timeMs.toLocaleString('cs-CZ')} ms / tah</span>
             </div>
             {showRawData && <pre className="raw-engine-data" aria-live="polite">{rawData || 'Čekám na výstup enginu…'}</pre>}
-            {viewMode === 'swap2' && moves.length < 3 && <div className="recommendation"><span className="recommendation-kicker">DOPORUČENÍ SWAP2</span><strong>Umístěte ještě {3 - moves.length} {moves.length === 2 ? 'kámen' : 'kameny'}</strong><p>Vyhodnocení se zobrazí po dokončení tříkamenového úvodu.</p></div>}
-            {viewMode === 'swap2' && moves.length >= 3 && recommendation && <div className={`recommendation recommendation-${recommendation.tone}`}><span className="recommendation-kicker">DOPORUČENÍ SWAP2</span><strong>{recommendation.title}</strong><p>{recommendation.detail}</p></div>}
-            {viewMode === 'partial' && pvMove && <div className="pv-callout"><span className="pv-mark">PV</span><div><strong>Nejlepší pokračování</strong><p>{String.fromCharCode(65 + pvMove.x)}{15 - pvMove.y} · tah {displayedMove + 1}</p></div><ArrowDownToLine size={16} /></div>}
-            {isBusy && <div className="analysis-progress"><span style={{ width: `${progress}%` }} /></div>}
+            {viewMode === 'swap2' && moves.length < openingConfig.stones && <div className="recommendation"><span className="recommendation-kicker">HODNOCENÍ ZAHÁJENÍ</span><strong>Umístěte ještě {openingConfig.stones - moves.length} {openingConfig.stones - moves.length === 1 ? 'kámen' : 'kameny'}</strong><p>Celé zahájení se vyhodnotí společně po dokončení.</p></div>}
+            {viewMode === 'swap2' && openingRating && <div className="opening-evaluation"><span className="recommendation-kicker">SPOLEČNÉ HODNOCENÍ ZAHÁJENÍ</span><strong>{ratingLabels[openingRating.rating] ?? 'Vyhodnoceno'}</strong><p>{openingRating.pointsChange >= 0 ? 'Zisk' : 'Ztráta'} hráče po výměně: {Math.abs(openingRating.pointsChange).toFixed(1)} bodu · výhoda černého {openingRating.pointAdvantage >= 0 ? '+' : ''}{openingRating.pointAdvantage.toFixed(1)} bodu</p></div>}
+            {viewMode === 'full' && pvMove && <div className="pv-callout"><span className="pv-mark">PV</span><div><strong>Nejlepší pokračování</strong><p>{String.fromCharCode(65 + pvMove.x)}{15 - pvMove.y} · po tahu {displayedMove}</p></div><ArrowDownToLine size={16} /></div>}
+            {isAnalysisRunning && <>
+              <div className="analysis-progress"><span style={{ width: `${progress}%` }} /></div>
+              {searchProgress && <div className="analysis-progress-meta">
+                {searchProgress.elapsedMs === undefined ? <span>{engineCapabilities.liveProgress ? 'Příprava vyhledávání…' : 'Průběžná data vyžadují nový WASM build'}</span> : <>
+                  <span>Hloubka {searchProgress.depth}/{searchProgress.maxDepth}</span>
+                  <span>{Math.round(searchProgress.nodes).toLocaleString('cs-CZ')} uzlů</span>
+                  <span>{(searchProgress.elapsedMs / 1000).toFixed(1)} s</span>
+                </>}
+                <span>Pozice {searchProgress.positionIndex + 1}/{searchProgress.totalPositions}</span>
+              </div>}
+            </>}
           </div>
 
-          <Suspense fallback={<section className="panel graph-panel graph-loading" aria-label="Načítání grafu" />}>
-            <EvaluationGraph analyses={analysis?.positions ?? []} viewMode={viewMode} currentMove={displayedMove} />
-          </Suspense>
+          {viewMode !== 'swap2' && <Suspense fallback={<section className="panel graph-panel graph-loading" aria-label="Načítání grafu" />}>
+            <EvaluationGraph analyses={analysis?.positions ?? []} viewMode="full" currentMove={displayedMove} />
+          </Suspense>}
 
-          <MoveList moves={moves} ratings={analysis?.ratings ?? []} currentMove={displayedMove} onSelect={(move) => { setViewMode('full'); changePosition(move) }} ratingLabels={ratingLabels} />
+          <MoveList moves={viewMode === 'swap2' ? visibleMoves.slice(0, openingConfig.stones) : visibleMoves} ratings={analysis?.ratings ?? []} currentMove={displayedMove} onSelect={(move) => { setViewMode('full'); changePosition(move) }} ratingLabels={ratingLabels} showRatings={viewMode !== 'swap2'} />
+        </div>
         </section>
       </div>
+      {pendingModeChange && (
+        <div className="mode-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title">
+          <div className="mode-confirm-panel">
+            <p className="eyebrow">PŘEPÍNÁNÍ REŽIMU</p>
+            <h2 id="mode-confirm-title">Chcete zachovat aktuální pozici, nebo vytvořit novou?</h2>
+            <div className="mode-confirm-actions">
+              <button type="button" className="button button-subtle" onClick={() => confirmModeChange('keep')}>Zachovat pozici</button>
+              <button type="button" className="button button-primary" onClick={() => confirmModeChange('new')}>Nová pozice</button>
+            </div>
+            <label className="remember-choice">
+              <input type="checkbox" checked={rememberModeChoice} onChange={(event) => setRememberModeChoice(event.target.checked)} />
+              <span>Vždy zvolit tuto možnost</span>
+            </label>
+            <button type="button" className="mode-confirm-cancel" onClick={() => setPendingModeChange(null)}>Zrušit</button>
+          </div>
+        </div>
+      )}
       <footer className="page-footer"><span>Analýza zůstává ve vašem zařízení.</span><span>{engineMode === 'wasm' ? 'Rapfi · WebAssembly' : 'Gomoku engine · Web Worker'}</span></footer>
     </main>
   )

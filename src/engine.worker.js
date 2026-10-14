@@ -1,4 +1,5 @@
 import { analyzeLocalPosition, rateMove, winProbability } from './engine/evaluation.js'
+import { findWinningLine } from './engine/game.js'
 
 const SIZE = 15
 let enginePromise
@@ -77,17 +78,40 @@ async function initializeEngine() {
       wasmLoadError = 'Modul rapfi.js neexportuje funkci _evaluate_board.'
       return null
     }
+    const supportsLiveSearchApi = Number(module._get_web_api_version?.()) >= 2
     return {
-      evaluatePosition: ({ moves, limits }) => evaluateWithWasm(module, moves, limits),
+      supportsLiveSearchApi,
+      evaluatePosition: ({ moves, limits, positionIndex }) => evaluateWithWasm(module, moves, limits, positionIndex, supportsLiveSearchApi),
     }
   })
   return enginePromise
 }
 
-function evaluateWithWasm(module, moves, limits = {}) {
+function evaluateWithWasm(module, moves, limits = {}, positionIndex = 0, supportsLiveSearchApi = false) {
   const moveText = moves.map(({ x, y, color }) => `${x},${y},${color === 'B' ? 1 : 2}`).join('\n')
   if (typeof module._set_search_limits === 'function') {
-    module._set_search_limits(Number(limits.depth) || 10, Number(limits.timeMs) || 750)
+    let allocatedTableSizeMb
+    if (supportsLiveSearchApi) {
+      allocatedTableSizeMb = module._set_search_limits(
+        Number(limits.depth) || 10,
+        Number(limits.timeMs) || 750,
+        Number(limits.tableSizeMb) || 512,
+        Number(limits.requestId) || 0,
+        positionIndex,
+        Number(limits.totalPositions) || 1,
+      )
+    } else {
+      module._set_search_limits(Number(limits.depth) || 10, Number(limits.timeMs) || 750)
+    }
+    if (Number.isFinite(allocatedTableSizeMb) || !supportsLiveSearchApi) {
+      self.postMessage({
+        type: 'table-size',
+        id: limits.requestId,
+        requestedMb: limits.tableSizeMb,
+        allocatedMb: allocatedTableSizeMb ?? 16,
+        supported: supportsLiveSearchApi,
+      })
+    }
   }
 
   const inputPtr = module.allocateUTF8(moveText)
@@ -102,10 +126,16 @@ function evaluateWithWasm(module, moves, limits = {}) {
   }
 }
 
-async function analyzePosition(engine, moves, board, sideToMove, limits) {
+async function analyzePosition(engine, moves, board, sideToMove, limits, positionIndex) {
+  self.postMessage({
+    type: 'search-start',
+    id: limits.requestId,
+    positionIndex,
+    totalPositions: limits.totalPositions,
+  })
   let result = null
   if (engine?.evaluatePosition) {
-    result = await engine.evaluatePosition({ moves, board, sideToMove, limits })
+    result = await engine.evaluatePosition({ moves, board, sideToMove, limits, positionIndex })
   } else if (engine?.runCommands) {
     result = await engine.runCommands(piskvorkCommands(moves, limits), limits)
   }
@@ -143,29 +173,68 @@ self.onmessage = async ({ data }) => {
       type: 'engine',
       mode: engineMode,
       loadError: engine ? '' : wasmLoadError,
+      capabilities: {
+        liveProgress: Boolean(engine?.supportsLiveSearchApi),
+        resizableTable: Boolean(engine?.supportsLiveSearchApi),
+      },
     })
+    const analysisMoves = data.opening
+      ? data.moves.slice(0, Number(data.opening.stones))
+      : data.moves
     const limits = {
       depth: Number(data.limits?.depth) || 10,
       timeMs: Number(data.limits?.timeMs) || 750,
+      tableSizeMb: Number(data.limits?.tableSizeMb) || 512,
+      requestId: data.id,
+      totalPositions: analysisMoves.length + 1,
     }
     const positions = []
     const ratings = []
     const board = createBoard([])
-    const initialPosition = await analyzePosition(engine, [], board, 'B', limits)
+    const initialPosition = await analyzePosition(engine, [], board, 'B', limits, 0)
     if (activeRequestId !== data.id) return
+    self.postMessage({
+      type: 'search-position-complete',
+      id: data.id,
+      positionIndex: 0,
+      progress: Math.round((1 / limits.totalPositions) * 100),
+    })
     positions.push(initialPosition)
     self.postMessage({ type: 'raw', id: data.id, lines: initialPosition.rawLines })
-    for (let index = 0; index < data.moves.length; index += 1) {
-      const move = data.moves[index]
+    for (let index = 0; index < analysisMoves.length; index += 1) {
+      const move = analysisMoves[index]
       board[move.y][move.x] = move.color
-      const positionMoves = data.moves.slice(0, index + 1)
+      const positionMoves = analysisMoves.slice(0, index + 1)
       const sideToMove = move.color === 'B' ? 'W' : 'B'
-      const position = await analyzePosition(engine, positionMoves, board, sideToMove, limits)
+      const winningLine = findWinningLine(positionMoves)
+      const position = winningLine
+        ? {
+            score: winningLine.color === 'B' ? 10000 : -10000,
+            winPercent: winningLine.color === 'B' ? 100 : 0,
+            pv: [],
+            onlyWinningLine: false,
+            winner: winningLine.color,
+            rawLines: [`MESSAGE ${winningLine.color} wins with exactly five in a row.`],
+          }
+        : await analyzePosition(engine, positionMoves, board, sideToMove, limits, index + 1)
       if (activeRequestId !== data.id) return
+      if (!winningLine) self.postMessage({
+        type: 'search-position-complete',
+        id: data.id,
+        positionIndex: index + 1,
+        progress: Math.round(((index + 2) / limits.totalPositions) * 100),
+      })
       positions.push(position)
-      ratings.push(rateMove(positions[index], positions[index + 1], move))
+      if (data.opening) {
+        ratings.push(index + 1 === Number(data.opening.stones) || winningLine
+          ? rateMove(initialPosition, position, { ...move, color: data.opening.ownerColor })
+          : null)
+      } else {
+        ratings.push(rateMove(positions[index], position, move))
+      }
       self.postMessage({ type: 'raw', id: data.id, lines: position.rawLines })
-      self.postMessage({ type: 'progress', id: data.id, progress: Math.round(((index + 1) / data.moves.length) * 100) })
+      self.postMessage({ type: 'progress', id: data.id, progress: Math.round(((index + 2) / limits.totalPositions) * 100) })
+      if (winningLine) break
     }
     if (activeRequestId === data.id) self.postMessage({ type: 'analysis', id: data.id, positions, ratings, engineMode })
   } catch (error) {

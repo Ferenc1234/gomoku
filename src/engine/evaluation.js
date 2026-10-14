@@ -2,7 +2,8 @@ const SIZE = 15
 const DIRECTIONS = [[1, 0], [0, 1], [1, 1], [1, -1]]
 
 function patternValue(length, openEnds) {
-  if (length >= 5) return 10000
+  if (length === 5) return 10000
+  if (length > 5) return 0
   if (length === 4) return openEnds === 2 ? 900 : openEnds === 1 ? 180 : 0
   if (length === 3) return openEnds === 2 ? 95 : openEnds === 1 ? 20 : 0
   if (length === 2) return openEnds === 2 ? 12 : openEnds === 1 ? 3 : 0
@@ -41,6 +42,13 @@ export function winProbability(score, scale = 0.01) {
   return Math.max(1e-9, Math.min(100 - 1e-9, probability))
 }
 
+export function advantagePoints(score) {
+  const value = Number(score || 0)
+  if (value >= 6000) return 12
+  if (value <= -6000) return -12
+  return Number((value / 100).toFixed(2))
+}
+
 function isWinningMove(board, x, y, color) {
   board[y][x] = color
   let wins = false
@@ -55,7 +63,7 @@ function isWinningMove(board, x, y, color) {
         nextY += dy * direction
       }
     }
-    if (count >= 5) wins = true
+    if (count === 5) wins = true
   }
   board[y][x] = null
   return wins
@@ -132,10 +140,32 @@ export function rateMove(before, after, move) {
   const afterChance = move.color === 'B' ? after.winPercent : 100 - after.winPercent
   const drop = Math.max(0, beforeChance - afterChance)
   const isBestMove = before.pv?.[0]?.x === move.x && before.pv?.[0]?.y === move.y
+  const beforeAdvantage = advantagePoints(before.score)
+  const afterAdvantage = advantagePoints(after.score)
+  const beforeMoverAdvantage = move.color === 'B' ? beforeAdvantage : -beforeAdvantage
+  const afterMoverAdvantage = move.color === 'B' ? afterAdvantage : -afterAdvantage
+  const pointLoss = Math.max(0, beforeMoverAdvantage - afterMoverAdvantage)
   let rating = 'blunder'
-  if (drop < 2) rating = drop < 0.5 ? 'best' : 'excellent'
-  else if (drop < 10) rating = 'inaccuracy'
-  else if (drop <= 20) rating = 'mistake'
-  if (drop === 0 && before.onlyWinningLine && isBestMove) rating = 'brilliant'
-  return { rating, drop: Number(drop.toFixed(1)), isBestMove }
+  if (Number.isFinite(before.score) && Number.isFinite(after.score)) {
+    if (pointLoss <= 0.1) rating = isBestMove ? 'best' : 'excellent'
+    else if (pointLoss <= 0.5) rating = 'excellent'
+    else if (pointLoss <= 1.5) rating = 'inaccuracy'
+    else if (pointLoss <= 3) rating = 'mistake'
+  } else {
+    if (drop < 2) rating = drop < 0.5 && isBestMove ? 'best' : 'excellent'
+    else if (drop < 10) rating = 'inaccuracy'
+    else if (drop <= 20) rating = 'mistake'
+  }
+  if (pointLoss <= 0.1 && drop === 0 && before.onlyWinningLine && isBestMove) rating = 'brilliant'
+  const pointsChange = afterMoverAdvantage - beforeMoverAdvantage
+  if (after.winner === move.color) rating = 'winning'
+  return {
+    rating,
+    drop: Number(drop.toFixed(1)),
+    isBestMove,
+    pointsChange: Number(pointsChange.toFixed(2)),
+    pointsLost: Number(Math.max(0, -pointsChange).toFixed(2)),
+    pointsGained: Number(Math.max(0, pointsChange).toFixed(2)),
+    pointAdvantage: afterAdvantage,
+  }
 }

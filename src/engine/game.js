@@ -78,10 +78,26 @@ function parseCoordinateText(source) {
   return moves
 }
 
+function parseCompactText(source) {
+  const tokens = [...source.matchAll(/([a-o])((?:1[0-5])|[1-9])/gi)]
+  return tokens.map((match, index) => ({
+    x: match[1].toLowerCase().charCodeAt(0) - 97,
+    y: 15 - Number(match[2]),
+    color: index % 2 === 0 ? 'B' : 'W',
+  }))
+}
+
 export function parseGameText(source) {
   const text = source.replace(/^\uFEFF/, '').trim()
   if (!text) throw new Error('Soubor neobsahuje žádné tahy.')
-  const moves = /\(\s*;/.test(text) ? parseSgf(text) : parseCoordinateText(text)
+  let moves
+  if (/\(\s*;/.test(text)) {
+    moves = parseSgf(text)
+  } else if (/^(?:[a-o](?:1[0-5]|[1-9]))+$/i.test(text)) {
+    moves = parseCompactText(text)
+  } else {
+    moves = parseCoordinateText(text)
+  }
   const seen = new Set()
   const validMoves = moves.filter(({ x, y }) => {
     if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE) return false
@@ -90,6 +106,42 @@ export function parseGameText(source) {
     seen.add(key)
     return true
   })
-  if (validMoves.length === 0) throw new Error('Nepodařilo se najít tahy v SGF ani v souřadnicích x,y.')
+  if (validMoves.length === 0) throw new Error('Nepodařilo se najít tahy v SGF, kompaktním zápisu g7j11 ani v souřadnicích x,y.')
   return validMoves
+}
+
+export function findWinningLine(moves) {
+  const board = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(null))
+  const directions = [[1, 0], [0, 1], [1, 1], [1, -1]]
+  const moveOrder = new Map()
+  moves.forEach((move, moveIndex) => {
+    board[move.y][move.x] = move.color
+    moveOrder.set(`${move.x},${move.y}`, moveIndex)
+  })
+
+  for (let y = 0; y < BOARD_SIZE; y += 1) {
+    for (let x = 0; x < BOARD_SIZE; x += 1) {
+      const color = board[y][x]
+      if (!color) continue
+      for (const [dx, dy] of directions) {
+        if (board[y - dy]?.[x - dx] === color) continue
+      const line = []
+        let lineX = x
+        let lineY = y
+        while (board[lineY]?.[lineX] === color) {
+          line.push({ x: lineX, y: lineY })
+          lineX += dx
+          lineY += dy
+        }
+        if (line.length === 5) {
+          return {
+            color,
+            line,
+            moveIndex: Math.max(...line.map(({ x: lineX, y: lineY }) => moveOrder.get(`${lineX},${lineY}`))),
+          }
+        }
+      }
+    }
+  }
+  return null
 }
