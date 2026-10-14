@@ -2,14 +2,29 @@ import { analyzeLocalPosition, rateMove, winProbability } from './engine/evaluat
 
 const SIZE = 15
 let enginePromise
+let wasmLoadError = 'Soubor rapfi.js nebo rapfi-simd128.js se nepodařilo načíst.'
 const wasmModulePromise = (async () => {
-  try {
-    const wasmUrl = new URL(`${import.meta.env.BASE_URL}engine/rapfi.js`, self.location.origin)
-    const { default: createModule } = await import(/* @vite-ignore */ wasmUrl.href)
-    return await createModule({ locateFile: (path) => new URL(path, wasmUrl).href })
-  } catch {
-    return null
+  const scriptCandidates = [
+    `${import.meta.env.BASE_URL}engine/rapfi.js`,
+    `${import.meta.env.BASE_URL}engine/rapfi-simd128.js`,
+  ]
+
+  for (const scriptPath of scriptCandidates) {
+    try {
+      const wasmUrl = new URL(scriptPath, self.location.origin)
+      const { default: createModule } = await import(/* @vite-ignore */ wasmUrl.href)
+      return await createModule({
+        locateFile: (path) => {
+          const resolvedPath = path.replace(/^rapfi-simd128(?=\.(?:js|wasm))/, 'rapfi')
+          return new URL(resolvedPath, wasmUrl).href
+        },
+      })
+    } catch (error) {
+      wasmLoadError = error instanceof Error ? error.message : String(error)
+    }
   }
+
+  return null
 })()
 
 function createBoard(moves) {
@@ -57,7 +72,11 @@ function moveToProtocol(move) {
 async function initializeEngine() {
   if (enginePromise) return enginePromise
   enginePromise = wasmModulePromise.then((module) => {
-    if (!module || typeof module._evaluate_board !== 'function') return null
+    if (!module) return null
+    if (typeof module._evaluate_board !== 'function') {
+      wasmLoadError = 'Modul rapfi.js neexportuje funkci _evaluate_board.'
+      return null
+    }
     return {
       evaluatePosition: ({ moves, limits }) => evaluateWithWasm(module, moves, limits),
     }
@@ -120,7 +139,11 @@ self.onmessage = async ({ data }) => {
   try {
     const engine = await initializeEngine()
     const engineMode = engine ? 'wasm' : 'heuristic'
-    self.postMessage({ type: 'engine', mode: engineMode })
+    self.postMessage({
+      type: 'engine',
+      mode: engineMode,
+      loadError: engine ? '' : wasmLoadError,
+    })
     const limits = {
       depth: Number(data.limits?.depth) || 10,
       timeMs: Number(data.limits?.timeMs) || 750,

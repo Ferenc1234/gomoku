@@ -22,3 +22,11 @@ emcmake cmake \
     -DUSE_WASM_SIMD=ON
 
 cmake --build "$BUILD_DIR" --target rapfi --parallel
+
+if [ -f "$ROOT_DIR/public/engine/rapfi-simd128.js" ]; then
+    cp -f "$ROOT_DIR/public/engine/rapfi-simd128.js" "$ROOT_DIR/public/engine/rapfi.js"
+fi
+
+if [ -f "$ROOT_DIR/public/engine/rapfi-simd128.wasm" ]; then
+    cp -f "$ROOT_DIR/public/engine/rapfi-simd128.wasm" "$ROOT_DIR/public/engine/rapfi.wasm"
+fi

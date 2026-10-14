@@ -40,6 +40,8 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState('')
   const [engineMode, setEngineMode] = useState('starting')
+  const [engineLoadError, setEngineLoadError] = useState('')
+  const [showHelp, setShowHelp] = useState(false)
   const [gameName, setGameName] = useState('Nová partie')
   const [engineStrength, setEngineStrength] = useState('balanced')
   const [showRawData, setShowRawData] = useState(false)
@@ -54,6 +56,7 @@ function App() {
     worker.onmessage = ({ data }) => {
       if (data.type === 'engine') {
         setEngineMode(data.mode)
+        setEngineLoadError(data.loadError ?? '')
         return
       }
       if (data.id !== requestIdRef.current) return
@@ -185,7 +188,35 @@ function App() {
         </a>
         <div className="topbar-right">
           <span className={`engine-status ${engineMode === 'wasm' ? 'is-wasm' : ''}`}><span />{engineMode === 'wasm' ? 'WASM engine' : engineMode === 'starting' ? 'Inicializace enginu' : 'Lokální heuristika'}</span>
-          <button className="icon-button help-button" type="button" title="O analýze" aria-label="O analýze"><CircleHelp size={17} /></button>
+          <button
+            className="icon-button help-button"
+            type="button"
+            title="Nápověda a stav enginu"
+            aria-label="Nápověda a stav enginu"
+            aria-expanded={showHelp}
+            aria-controls="engine-help"
+            onClick={() => setShowHelp((visible) => !visible)}
+          >
+            <CircleHelp size={17} />
+          </button>
+          {showHelp && (
+            <aside className="help-popover" id="engine-help" role="dialog" aria-labelledby="engine-help-title">
+              <div className="help-popover-heading">
+                <div>
+                  <span className="eyebrow">STAV ANALÝZY</span>
+                  <h2 id="engine-help-title">{engineMode === 'wasm' ? 'Rapfi WASM je připraven' : 'Rapfi WASM není načten'}</h2>
+                </div>
+                <button className="icon-button help-close" type="button" aria-label="Zavřít nápovědu" onClick={() => setShowHelp(false)}>×</button>
+              </div>
+              <p>{engineMode === 'wasm' ? 'Tahové pozice vyhodnocuje Rapfi běžící lokálně ve Web Workeru.' : 'Aplikace nyní používá záložní lokální heuristiku. K načtení Rapfi je potřeba vygenerovat WASM soubory.'}</p>
+              {engineMode !== 'wasm' && <pre className="help-error">{engineLoadError || 'Čekám na odpověď workeru…'}</pre>}
+              <div className="help-build">
+                <span className="eyebrow">PO DOKONČENÍ EMSCRIPTEN SETUPU</span>
+                <code>bash scripts/build-wasm.sh</code>
+                <span>Výstup musí být v <code>public/engine/rapfi.js</code> a <code>rapfi.wasm</code>.</span>
+              </div>
+            </aside>
+          )}
         </div>
       </header>
 

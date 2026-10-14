@@ -1,6 +1,6 @@
 # Rapfi WebAssembly
 
-Run `bash scripts/build-wasm.sh` after activating Emscripten. It writes `rapfi.js` and `rapfi.wasm` into this directory. The build compiles the Rapfi core without `main()` and exports `evaluate_board` plus `set_search_limits`.
+Run `bash scripts/build-wasm.sh` after activating Emscripten. The script compiles the Rapfi core without `main()`, then copies the generated SIMD artifact to `rapfi.js` and `rapfi.wasm` in this directory. The exported C++ API provides `evaluate_board` and `set_search_limits`.
 
 The worker creates one Emscripten module instance and calls `_evaluate_board` for each position. The C++ adapter keeps Rapfi's global `Search::Engine`, board history, and transposition table alive. It accepts one `x,y,player` move per line; the React SGF parser normalizes SGF to this format before calling WASM. Coordinates are zero-based and player `1` is black, `2` white.
 
