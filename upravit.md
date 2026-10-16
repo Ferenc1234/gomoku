@@ -1,0 +1,6 @@
+- Pokud kliknu na tah, ukáže to nejlepší tah který mohl být proveden, ne ten další nejlepší. 
+- Barevně označit tahy: 
+    - zelená: nejlepší tah, který měl být proveden místo aktuálního
+    - červená: pokud by hráč místo tohoto kroku jel zde, měl by nucenou prohru
+    - modrá: právě provedený tah
+    - zašedlé kolečko (jako je teď) další nejlepší tah pro soupeře smazat, ať se nezobrazuje
