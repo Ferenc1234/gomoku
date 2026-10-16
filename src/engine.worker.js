@@ -19,6 +19,12 @@ const NNUE_CONFIG = {
   cacheName: 'gomoku-engine-nnue-v1',
 }
 
+// The engine files in public/ are served from fixed URLs, so browsers (and the
+// GitHub Pages CDN) may keep an older copy after a rebuild. Appending a
+// per-build version forces a fresh fetch of both the glue and the wasm so an
+// old artifact can never disable the optional NNUE API.
+const ENGINE_VERSION = typeof __ENGINE_VERSION__ === 'string' ? __ENGINE_VERSION__ : 'dev'
+
 let enginePromise
 let wasmModule = null
 let wasmLoadError = 'Soubor rapfi.js nebo rapfi-simd128.js se nepodařilo načíst.'
@@ -26,8 +32,8 @@ let nnueLoadPromise = null
 let nnueActive = null
 const wasmModulePromise = (async () => {
   const scriptCandidates = [
-    `${import.meta.env.BASE_URL}engine/rapfi.js`,
-    `${import.meta.env.BASE_URL}engine/rapfi-simd128.js`,
+    `${import.meta.env.BASE_URL}engine/rapfi.js?v=${ENGINE_VERSION}`,
+    `${import.meta.env.BASE_URL}engine/rapfi-simd128.js?v=${ENGINE_VERSION}`,
   ]
 
   for (const scriptPath of scriptCandidates) {
@@ -37,7 +43,9 @@ const wasmModulePromise = (async () => {
       wasmModule = await createModule({
         locateFile: (path) => {
           const resolvedPath = path.replace(/^rapfi-simd128(?=\.(?:js|wasm))/, 'rapfi')
-          return new URL(resolvedPath, wasmUrl).href
+          const resolvedUrl = new URL(resolvedPath, wasmUrl)
+          resolvedUrl.searchParams.set('v', ENGINE_VERSION)
+          return resolvedUrl.href
         },
       })
       return wasmModule
