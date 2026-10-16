@@ -7,8 +7,23 @@ function automaticTableSizeMb() {
   const quarterMemoryMb = deviceMemoryGb * 1024 * 0.25
   return Math.min(512, Math.max(64, Math.floor(quarterMemoryMb / 16) * 16))
 }
+
+// The optional stronger engine is Rapfi's official mix9svq NNUE network. It is
+// ~10 MB, so instead of bundling it we download it on demand, keep it in the
+// Cache Storage API, and hand the bytes to the WASM filesystem before pointing
+// Rapfi's evaluator config at the file.
+const NNUE_CONFIG = {
+  evalType: 'mix9svq',
+  fileName: 'mix9svqfreestyle_bsmix.bin.lz4',
+  url: 'https://raw.githubusercontent.com/dhbloo/rapfi-networks/main/mix9svq/mix9svqfreestyle_bsmix.bin.lz4',
+  cacheName: 'gomoku-engine-nnue-v1',
+}
+
 let enginePromise
+let wasmModule = null
 let wasmLoadError = 'Soubor rapfi.js nebo rapfi-simd128.js se nepodařilo načíst.'
+let nnueLoadPromise = null
+let nnueActive = null
 const wasmModulePromise = (async () => {
   const scriptCandidates = [
     `${import.meta.env.BASE_URL}engine/rapfi.js`,
@@ -19,12 +34,13 @@ const wasmModulePromise = (async () => {
     try {
       const wasmUrl = new URL(scriptPath, self.location.origin)
       const { default: createModule } = await import(/* @vite-ignore */ wasmUrl.href)
-      return await createModule({
+      wasmModule = await createModule({
         locateFile: (path) => {
           const resolvedPath = path.replace(/^rapfi-simd128(?=\.(?:js|wasm))/, 'rapfi')
           return new URL(resolvedPath, wasmUrl).href
         },
       })
+      return wasmModule
     } catch (error) {
       wasmLoadError = error instanceof Error ? error.message : String(error)
     }
@@ -32,6 +48,114 @@ const wasmModulePromise = (async () => {
 
   return null
 })()
+
+async function readCachedWeights() {
+  if (typeof caches === 'undefined') return null
+  try {
+    const cache = await caches.open(NNUE_CONFIG.cacheName)
+    const cached = await cache.match(NNUE_CONFIG.url)
+    if (!cached) return null
+    return new Uint8Array(await cached.arrayBuffer())
+  } catch {
+    return null
+  }
+}
+
+async function fetchNnueWeights(onProgress) {
+  const cachedBytes = await readCachedWeights()
+  if (cachedBytes) {
+    onProgress({ loaded: cachedBytes.byteLength, total: cachedBytes.byteLength, cached: true })
+    return cachedBytes
+  }
+
+  const response = await fetch(NNUE_CONFIG.url, { mode: 'cors', redirect: 'follow' })
+  if (!response.ok) throw new Error(`Stažení NNUE sítě selhalo (HTTP ${response.status}).`)
+  const total = Number(response.headers.get('content-length')) || 0
+  let bytes
+
+  if (response.body?.getReader) {
+    const reader = response.body.getReader()
+    const chunks = []
+    let loaded = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      loaded += value.byteLength
+      onProgress({ loaded, total, cached: false })
+    }
+    bytes = new Uint8Array(loaded)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+  } else {
+    bytes = new Uint8Array(await response.arrayBuffer())
+    onProgress({ loaded: bytes.byteLength, total: bytes.byteLength, cached: false })
+  }
+
+  if (typeof caches !== 'undefined') {
+    try {
+      const cache = await caches.open(NNUE_CONFIG.cacheName)
+      await cache.put(NNUE_CONFIG.url, new Response(bytes.slice(0), {
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': String(bytes.byteLength),
+        },
+      }))
+    } catch {
+      // A full or unavailable cache is not fatal: the weights still work this session.
+    }
+  }
+
+  return bytes
+}
+
+async function ensureNnue(requestId) {
+  if (nnueActive === true) return true
+  if (nnueLoadPromise) return nnueLoadPromise
+  nnueLoadPromise = (async () => {
+    try {
+      const module = await wasmModulePromise
+      if (!module) throw new Error(wasmLoadError)
+      if (!module.FS || typeof module._enable_nnue !== 'function') {
+        throw new Error('Tato verze WASM nepodporuje NNUE. Sestavte engine znovu.')
+      }
+
+      self.postMessage({ type: 'nnue-progress', id: requestId, phase: 'download', loaded: 0, total: 0, cached: false })
+      const bytes = await fetchNnueWeights((progress) => {
+        self.postMessage({ type: 'nnue-progress', id: requestId, phase: 'download', ...progress })
+      })
+
+      self.postMessage({ type: 'nnue-progress', id: requestId, phase: 'load', loaded: bytes.byteLength, total: bytes.byteLength, cached: false })
+      const filePath = `/${NNUE_CONFIG.fileName}`
+      module.FS.writeFile(filePath, bytes)
+
+      const filePtr = module.allocateUTF8(filePath)
+      const typePtr = module.allocateUTF8(NNUE_CONFIG.evalType)
+      let status
+      try {
+        status = module._enable_nnue(filePtr, typePtr)
+      } finally {
+        module._free(filePtr)
+        module._free(typePtr)
+      }
+      if (status !== 0) throw new Error(`Rapfi nepřijal NNUE konfiguraci (kód ${status}).`)
+
+      nnueActive = true
+      self.postMessage({ type: 'nnue-status', id: requestId, enabled: true, error: '' })
+      return true
+    } catch (error) {
+      nnueActive = false
+      nnueLoadPromise = null
+      const message = error instanceof Error ? error.message : String(error)
+      self.postMessage({ type: 'nnue-status', id: requestId, enabled: false, error: message })
+      return false
+    }
+  })()
+  return nnueLoadPromise
+}
 
 function createBoard(moves) {
   const board = Array.from({ length: SIZE }, () => Array(SIZE).fill(null))
@@ -125,6 +249,15 @@ function evaluateWithWasm(module, moves, limits = {}, positionIndex = 0, support
     if (!resultPtr) throw new Error('Rapfi nevrátil výsledek analýzy.')
     const result = JSON.parse(module.UTF8ToString(resultPtr))
     if (result.error) throw new Error(result.error)
+    if (typeof result.nnue === 'boolean' && result.nnue !== nnueActive) {
+      nnueActive = result.nnue
+      self.postMessage({
+        type: 'nnue-status',
+        id: limits.requestId,
+        enabled: result.nnue,
+        error: result.nnue ? '' : 'Rapfi použil klasickou evaluaci, NNUE síť se nenačetla.',
+      })
+    }
     return result
   } finally {
     module._free(inputPtr)
@@ -181,8 +314,13 @@ self.onmessage = async ({ data }) => {
       capabilities: {
         liveProgress: Boolean(engine?.supportsLiveSearchApi),
         resizableTable: Boolean(engine?.supportsLiveSearchApi),
+        nnue: Boolean(engine && typeof wasmModule?._enable_nnue === 'function'),
       },
     })
+    if (data.nnue && engine) {
+      await ensureNnue(data.id)
+      if (activeRequestId !== data.id) return
+    }
     const analysisMoves = data.opening
       ? data.moves.slice(0, Number(data.opening.stones))
       : data.moves
@@ -254,6 +392,7 @@ self.onmessage = async ({ data }) => {
       ratings,
       openingRating: data.opening && positions[analysisMoves.length] ? rateOpening(positions[analysisMoves.length]) : null,
       engineMode,
+      nnue: nnueActive === true,
     })
   } catch (error) {
     self.postMessage({ type: 'error', id: data.id, message: error instanceof Error ? error.message : 'Analýza selhala.' })

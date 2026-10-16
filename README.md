@@ -29,7 +29,9 @@ Hodnocení používá sigmoid s výchozím `k = 0.01`; pokles šance se měří 
 
 Worker při startu načte `public/engine/rapfi.js` jednou a opakovaně volá exportované C++ API; adaptér zachovává Rapfi `Search::Engine` a transpoziční tabulku mezi pozicemi. SGF se předá do WASM jako normalizované řádky `x,y,player` z parseru aplikace.
 
-Po instalaci/aktivaci Emscripten SDK spusťte `bash scripts/build-wasm.sh`. Build používá Rapfiho interní classical eval tabulky, takže nepotřebuje `Networks` submodule. Rozhraní adaptéru a omezení tohoto výchozího modelu jsou popsány v [public/engine/README.md](public/engine/README.md). Pokud WASM soubor chybí, aplikace přejde na lokální heuristiku ve workeru.
+Po instalaci/aktivaci Emscripten SDK spusťte `bash scripts/build-wasm.sh`. Výchozí build používá Rapfiho interní classical eval tabulky, takže nepotřebuje `Networks` submodule a WASM zůstává malý (~1 MB). Rozhraní adaptéru a omezení tohoto výchozího modelu jsou popsány v [public/engine/README.md](public/engine/README.md). Pokud WASM soubor chybí, aplikace přejde na lokální heuristiku ve workeru.
+
+Volitelně lze tlačítkem **Silnější engine · NNUE** stáhnout oficiální mix9svq NNUE síť (~10 MB, CC0) a použít ji místo classical evaluace. Váhy se ukládají do Cache Storage a načítají se do WASM za běhu; při dalším rozboru se znovu použijí z cache. Aktivní režim je v UI označen jako `WASM · NNUE`, vypnutí tlačítkem se vrátí ke classical evaluaci. Tato funkce vyžaduje WASM sestavený s NNUE rozhraním (viz `public/engine/README.md`).
 
 ## GitHub Pages
 

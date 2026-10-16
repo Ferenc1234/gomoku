@@ -666,6 +666,24 @@
 .table-size-control label strong { margin-left: 5px; color: #3e493a; font-family: 'DM Mono', monospace; }
 .table-size-control input { width: 100%; grid-column: 1 / -1; margin: 2px 0; accent-color: #88a92d; }
 .table-size-control > span { grid-column: 1 / -1; color: #92988e; font-size: 9px; }
+.nnue-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin: 12px 18px 0;
+  padding-top: 12px;
+  border-top: 1px solid #eef0ea;
+}
+.nnue-control-copy { display: grid; gap: 2px; flex: 1 1 170px; min-width: 0; }
+.nnue-control-title { display: inline-flex; align-items: center; gap: 6px; color: #3e493a; font-size: 10px; font-weight: 800; }
+.nnue-control-status { color: #92988e; font-size: 9px; line-height: 1.45; }
+.nnue-control-status.is-active { color: #526a28; font-weight: 700; }
+.nnue-control-status.is-error { color: #a23e32; }
+.nnue-progress { flex: 1 1 100%; height: 5px; overflow: hidden; border-radius: 3px; background: #e8ece1; }
+.nnue-progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #88a92d, #5f7d1c); transition: width 0.2s ease; }
+.nnue-button { flex: 0 0 auto; white-space: nowrap; }
 .analysis-progress-meta {
   display: flex;
   justify-content: space-between;

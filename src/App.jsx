@@ -16,6 +16,8 @@ const SEARCH_STRENGTHS = {
 const OPENING_LIMITS = { depth: 30, timeMs: 120000 }
 
 const MODE_CHOICE_STORAGE_KEY = 'gomoku-mode-choice'
+const NNUE_STORAGE_KEY = 'gomoku-nnue-enabled'
+const NNUE_SIZE_MB = 10
 
 const ratingLabels = {
   brilliant: 'Zářivý',
@@ -49,8 +51,15 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState('')
   const [engineMode, setEngineMode] = useState('starting')
-  const [engineCapabilities, setEngineCapabilities] = useState({ liveProgress: false, resizableTable: false })
+  const [engineCapabilities, setEngineCapabilities] = useState({ liveProgress: false, resizableTable: false, nnue: false })
   const [engineLoadError, setEngineLoadError] = useState('')
+  const [nnueEnabled, setNnueEnabled] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(NNUE_STORAGE_KEY) === 'true'
+  })
+  const [nnueActive, setNnueActive] = useState(false)
+  const [nnueDownload, setNnueDownload] = useState(null)
+  const [nnueError, setNnueError] = useState('')
   const [showHelp, setShowHelp] = useState(false)
   const [gameName, setGameName] = useState('Nová partie')
   const [engineStrength, setEngineStrength] = useState('balanced')
@@ -90,10 +99,20 @@ function App() {
         if (data.type === 'engine') {
           setEngineMode(data.mode)
           setEngineLoadError(data.loadError ?? '')
-          setEngineCapabilities(data.capabilities ?? { liveProgress: false, resizableTable: false })
+          setEngineCapabilities(data.capabilities ?? { liveProgress: false, resizableTable: false, nnue: false })
           return
         }
         if (data.id !== requestIdRef.current) return
+        if (data.type === 'nnue-progress') {
+          setNnueDownload(data)
+          return
+        }
+        if (data.type === 'nnue-status') {
+          setNnueActive(Boolean(data.enabled))
+          setNnueError(data.enabled ? '' : (data.error ?? ''))
+          setNnueDownload(null)
+          return
+        }
         if (data.type === 'table-size') {
           setAllocatedTableSizeMb(data.allocatedMb)
           return
@@ -172,11 +191,12 @@ function App() {
         id,
         moves: analysisMoves,
         opening: openingMode,
+        nnue: nnueEnabled,
         limits: { ...analysisLimits, tableSizeMb, requestId: id },
       })
     }, restartingWorker ? 250 : 0)
     return () => window.clearTimeout(startTimer)
-  }, [analysisMoves, analysisLimits, openingMode, tableSizeMb])
+  }, [analysisMoves, analysisLimits, openingMode, tableSizeMb, nnueEnabled])
   const isAnalysisRunning = progress < 100 && !error
   useEffect(() => {
     if (!isAnalysisRunning || searchStartedAt === null) return undefined
@@ -321,8 +341,34 @@ function App() {
     if (value !== 'custom') setEngineConfig(SEARCH_STRENGTHS[value])
   }
 
+  function toggleNnue() {
+    setNnueEnabled((current) => {
+      const next = !current
+      if (typeof window !== 'undefined') window.localStorage.setItem(NNUE_STORAGE_KEY, String(next))
+      if (!next) setNnueActive(false)
+      return next
+    })
+    setNnueError('')
+    setNnueDownload(null)
+  }
+
   const winPercent = currentAnalysis?.winPercent
   const isCalculating = !error && (searchProgress?.positionIndex === displayedMove || !currentAnalysis)
+  const nnuePercent = nnueDownload?.total ? Math.min(100, Math.round((nnueDownload.loaded / nnueDownload.total) * 100)) : 0
+  const nnueStatusText = !engineCapabilities.nnue && engineMode === 'wasm'
+    ? 'Tato verze WASM NNUE neobsahuje, sestavte engine znovu.'
+    : nnueError
+      ? nnueError
+      : !nnueEnabled
+        ? `Volitelný ~${NNUE_SIZE_MB} MB NNUE model pro výrazně silnější analýzu.`
+        : nnueActive
+          ? 'Aktivní · Rapfi počítá s NNUE sítí.'
+          : nnueDownload?.phase === 'load'
+            ? 'Načítám síť do enginu…'
+            : nnueDownload
+              ? `Stahuji NNUE síť… ${nnuePercent} %`
+              : 'Připravuji síť…'
+  const nnueButtonLabel = !nnueEnabled ? 'Stáhnout silnější engine' : nnueActive ? 'Vypnout' : 'Zrušit stahování'
   const pvMove = currentAnalysis?.pv?.[0]
   const principalVariation = currentAnalysis?.pv ?? []
 
@@ -426,7 +472,7 @@ function App() {
           <div className="panel evaluation-panel">
             <div className="panel-heading evaluation-heading">
               <div><span className="eyebrow">POZICE PO {displayedMove} TAZÍCH</span><h2>Šance na výhru</h2></div>
-              <span className="eval-chip"><Cpu size={14} /> {engineMode === 'wasm' ? 'WASM' : 'CPU'}</span>
+              <span className="eval-chip"><Cpu size={14} /> {engineMode === 'wasm' ? (nnueActive ? 'WASM · NNUE' : 'WASM') : 'CPU'}</span>
             </div>
             <div className="win-split"><span className="win-side white-side"><span>Engine body</span><strong>{currentAnalysis?.score === undefined ? '—' : formatEnginePoints(currentAnalysis.score)}</strong></span><div className="split-track"><span style={{ width: `${winPercent === undefined ? 50 : 100 - winPercent}%` }} /></div><span className="win-side black-side"><span>Výhoda</span><strong>{currentAnalysis?.score === undefined ? '—' : displayEngineWinner(currentAnalysis.score)}</strong></span>{isCalculating && <div className="score-loading-overlay" role="status"><span className="loading-spinner" /><span>Počítám pozici…</span></div>}</div>
             {viewMode === 'swap2' ? <div className="opening-limit-summary">Zahájení: hloubka 30 · 120 000 ms / tah</div> : <>
@@ -442,6 +488,20 @@ function App() {
                 <label><span>Čas / tah (ms)</span><input type="number" min="50" max="120000" step="50" value={engineConfig.timeMs} onChange={(event) => updateEngineConfig('timeMs', event.target.value)} /></label>
               </div>
             </>}
+            <div className="nnue-control">
+              <div className="nnue-control-copy">
+                <span className="nnue-control-title"><Cpu size={14} /> Silnější engine · NNUE</span>
+                <span className={`nnue-control-status${nnueError ? ' is-error' : nnueActive ? ' is-active' : ''}`}>{nnueStatusText}</span>
+              </div>
+              {nnueEnabled && !nnueActive && !nnueError && nnueDownload && (
+                <div className="nnue-progress" role="progressbar" aria-valuenow={nnuePercent} aria-valuemin={0} aria-valuemax={100}>
+                  <span style={{ width: `${nnuePercent}%` }} />
+                </div>
+              )}
+              <button className={`button nnue-button ${nnueEnabled && !nnueError ? 'button-subtle' : 'button-primary'}`} type="button" onClick={toggleNnue}>
+                {nnueButtonLabel}
+              </button>
+            </div>
             <div className="table-size-control">
               <label>Transpoziční tabulka <strong>Automaticky</strong></label>
               <span>{engineMode !== 'wasm' ? 'Dostupné s Rapfi WASM' : !engineCapabilities.resizableTable ? 'WASM je třeba znovu sestavit pro automatickou velikost' : allocatedTableSizeMb === null ? 'Zjišťuji bezpečnou velikost…' : `Rapfi alokoval ${allocatedTableSizeMb} MB`}</span>
